@@ -325,6 +325,7 @@ Panel {
     }
 
     Text {
+      textFormat: Text.PlainText
       anchors.centerIn: parent
       visible: !art.showsImage
       text: art.placeholder
@@ -441,6 +442,7 @@ Panel {
               Row {
                 spacing: Style.space(6)
                 Text {
+                  textFormat: Text.PlainText
                   text: Model.glyph.spotify
                   color: root.foreground
                   font.family: root.fontFamily
@@ -448,6 +450,7 @@ Panel {
                   anchors.verticalCenter: parent.verticalCenter
                 }
                 Text {
+                  textFormat: Text.PlainText
                   text: "SPOTIFY"
                   color: root.foreground
                   font.family: root.fontFamily
@@ -518,6 +521,7 @@ Panel {
             bottomPadding: Style.space(8)
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               text: root.service && root.service.needsReauth ? "Your Spotify session expired" : "Connect your Spotify account"
               color: root.foreground
@@ -528,6 +532,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               visible: root.service && root.service.needsReauth
               text: "Spotify limits a login to six months. Connect again and everything picks up where it left off."
@@ -552,6 +557,7 @@ Panel {
                   spacing: Style.space(8)
 
                   Text {
+                    textFormat: Text.PlainText
                     text: String(index + 1)
                     color: root.accent
                     font.family: root.fontFamily
@@ -560,6 +566,7 @@ Panel {
                     width: Style.space(12)
                   }
                   Text {
+                    textFormat: Text.PlainText
                     width: parent.width - Style.space(20)
                     text: modelData
                     color: root.dim
@@ -608,6 +615,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               visible: root.service && root.service.authRunning
               width: parent.width
               text: "Waiting for you to approve in the browser… this closes on its own once Spotify redirects back."
@@ -637,6 +645,7 @@ Panel {
               PanelSeparator { foreground: root.foreground }
 
               Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 text: "This panel needs a player to drive: the Spotify desktop app, or the headless Spotify Soloist daemon (see the README). Neither is installed yet."
                 color: root.dim
@@ -660,6 +669,7 @@ Panel {
                   onClicked: root.launchInstall()
                 }
                 Text {
+                  textFormat: Text.PlainText
                   text: "or run: " + Model.installCommand
                   color: root.faint
                   font.family: root.fontFamily
@@ -767,6 +777,7 @@ Panel {
                   height: elapsed.implicitHeight
 
                   Text {
+                    textFormat: Text.PlainText
                     id: elapsed
                     anchors.left: parent.left
                     text: Model.fmtTime(progressSlider.dragging ? progressSlider.liveValue : root.progressMs)
@@ -775,6 +786,7 @@ Panel {
                     font.pixelSize: Style.font.caption
                   }
                   Text {
+                    textFormat: Text.PlainText
                     anchors.right: parent.right
                     text: root.durationMs > 0 ? Model.fmtTime(root.durationMs) : "–:––"
                     color: root.faint
@@ -872,6 +884,7 @@ Panel {
                 opacity: volumeAvailable ? 1.0 : 0.4
 
                 Text {
+                  textFormat: Text.PlainText
                   text: Model.volumeGlyph(root.service ? root.service.volume : -1)
                   color: root.foreground
                   font.family: root.fontFamily
@@ -1004,6 +1017,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               visible: root.service && !root.service.devicesLoading && root.service.devices.length === 0
               width: parent.width
               text: "Spotify sees no devices. Open the Spotify app on this machine or your phone and it appears here."
@@ -1487,6 +1501,7 @@ Panel {
                           elide: Text.ElideRight
                         }
                         Text {
+                          textFormat: Text.PlainText
                           id: nowGlyph
                           visible: rowItem.isNow
                           text: root.isPlaying ? Model.glyph.volumeHigh : Model.glyph.pause
