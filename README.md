@@ -1,36 +1,51 @@
 # Spotify for Omarchy
 
-Spotify in the Omarchy bar. The chip shows the cover of what's playing (or
-what played last) next to a scrolling title; click it for a panel with the
-full now-playing hero, transport, volume, device switcher, and four tabs —
-**Search**, **Playlists**, **Books**, **Podcasts**.
+Spotify, living in your Omarchy bar.
 
-- **Now playing** — cover art, title, artist · album, seekable progress,
-  shuffle / previous / play-pause / next / repeat, volume, and a heart to
-  save or unsave the current track.
-- **Search** — tracks, artists, albums, playlists, podcasts, episodes and
-  audiobooks in one query, grouped. Empty search shows recently played.
-- **Playlists** — Liked Songs plus every playlist you own or follow; open
-  one to see its tracks, play from any row, or shuffle the lot.
-- **Books** — your saved audiobooks with chapter lists and resume progress.
-- **Podcasts** — shows you follow, episodes with dates, length and how far
-  in you are.
-- **Devices** — see every Spotify Connect device, switch playback, launch
-  the desktop app, or sign out.
-- **Keyboard first** — the whole panel drives from the keyboard (see below).
+The bar shows a little cover of whatever is playing. Click it and you get the
+whole thing: album art, play/pause/skip, a seek bar, volume, a heart, your
+playlists, audiobooks and podcasts, and search across all of Spotify. It can
+even play music with no Spotify window open at all.
 
-## Requirements
+![The Spotify panel open under the bar](preview.png)
 
-- Omarchy 4 (Quickshell shell).
-- **Spotify Premium.** Spotify requires it for playback control, and since
-  February 2026 also for any Web API app in development mode.
-- A Spotify **developer app** of your own (two-minute one-time setup; the
-  panel walks you through it). Spotify no longer lets third-party apps share
-  a client ID, so each install brings its own.
-- A playback device. The Spotify desktop app is the obvious one
-  (`omarchy install service spotify`); a phone or speaker on the same
-  account works too.
-- Python 3 (standard library only) — the plugin's bridge to the Web API.
+| Search results | Audiobook chapters | Devices and headless player |
+|---|---|---|
+| ![Search](preview1.png) | ![Audiobook](preview2.png) | ![Devices](preview3.png) |
+
+## What you get
+
+- **In the bar:** the current cover art (or the last thing you played) and a
+  scrolling "Title · Artist". Left-click opens the panel, middle-click
+  pauses, right-click skips, scrolling changes the volume.
+- **Now playing:** big cover, title, artist and album, a seek bar you can
+  drag, shuffle / previous / play / next / repeat, a volume slider, and a
+  heart that saves the track to your library.
+- **Search:** type once and get tracks, artists, albums, playlists, podcasts,
+  episodes and audiobooks, grouped. With nothing typed you see what you
+  played recently.
+- **Playlists:** Liked Songs plus everything you made or follow. Open one to
+  see its tracks, play from any row, or shuffle the whole thing.
+- **Books:** your saved audiobooks, with every chapter and how far you got.
+- **Podcasts:** shows you follow, with episodes, dates, length and progress.
+- **Devices:** switch between your computer, phone, speakers and so on, or
+  set up a headless player that needs no window (more below).
+- **Keyboard:** everything works without a mouse. See the cheat sheet.
+
+## Before you start
+
+You need three things. Two of them are Spotify's rules, not ours.
+
+1. **Spotify Premium.** Spotify only lets Premium accounts be controlled
+   this way.
+2. **A Spotify "developer app".** This is a free, two-minute step on
+   Spotify's website that gives the plugin permission to talk to your
+   account. Every person needs their own; Spotify does not allow sharing
+   one. The panel walks you through it.
+3. **Something to play the sound.** The panel is a remote control, not a
+   speaker. It drives any Spotify Connect device: the Spotify desktop app,
+   your phone, a speaker, or the headless player the panel can install for
+   you.
 
 ## Install
 
@@ -38,180 +53,199 @@ full now-playing hero, transport, volume, device switcher, and four tabs —
 omarchy plugin add https://github.com/ninepointlabs/omarchy-spotify.git --enable
 ```
 
-That clones into `~/.config/omarchy/plugins/ninepointlabs.spotify` and adds
-the chip to the bar's right section. Move it wherever you like:
+The chip appears in the right section of the bar. Put it wherever you like:
 
 ```sh
 omarchy bar move ninepointlabs.spotify --before omarchy.audio
 ```
 
-From a local checkout (this repo's own convention is `~/Projects/omarchy-spotify`):
-
-```sh
-./install.sh            # copies into ~/.config/omarchy/plugins and enables it
-```
+If you cloned this repository instead, run `./install.sh` from inside it.
 
 ## Connect your account
 
-1. Open <https://developer.spotify.com/dashboard> and **Create app**.
-   Name and description are yours to pick.
-2. Under **Redirect URIs** add exactly
-   `http://127.0.0.1:8888/callback` (use the IP, not `localhost` — Spotify
-   rejects that). Tick **Web API** and save.
-3. Copy the app's **Client ID**, open the panel, paste it, and click
-   **Connect…**. Your browser opens Spotify's consent page; approve, and the
-   panel flips to the player on its own.
+Click the chip. The panel shows three steps; here they are in full.
 
-Tokens live in `~/.local/state/omarchy-spotify/auth.json` (mode 0600). No
-client secret is involved — the login uses PKCE. Spotify caps a login at six
-months; when it lapses the panel shows the connect card again and one click
-picks up where you left off. **Sign out** lives under the device button.
+1. Open <https://developer.spotify.com/dashboard>, sign in with your Spotify
+   account, and click **Create app**. Name it anything you like.
+2. In the app's settings, under **Redirect URIs**, type exactly
 
-If port 8888 is taken, change `redirectPort` in the widget's settings and use
-the matching redirect URI in the Spotify dashboard.
+   ```
+   http://127.0.0.1:8888/callback
+   ```
 
-## Playing without the Spotify app open
+   then click **Add**, tick **Web API**, and **Save**. Spotify rejects
+   `localhost`, so use the numbers. (If you ever see
+   *"redirect_uri: Not matching configuration"*, this line is wrong or was
+   never saved.)
+3. Copy the app's **Client ID** into the panel and click **Connect**. Your
+   browser opens Spotify's permission page; approve it and the panel
+   switches to the player by itself.
 
-The Web API only steers a Spotify Connect device; it never plays audio
-itself. [Spotify Soloist](https://developer.spotify.com/documentation/soloist)
-is Spotify's own headless Connect client for Linux (announced August 2026).
-Run it as a systemd user service and the panel works with no window anywhere.
+That's the whole connection. It stays connected for six months; after that
+the panel shows the same card again and one click renews it.
 
-> Why not spotifyd / librespot? Since late 2025 Spotify refuses audio
-> decryption keys to librespot-based players for accounts created after
-> roughly 2024, so they connect fine but skip every track in silence
-> ([librespot#1649](https://github.com/librespot-org/librespot/issues/1649)).
-> Soloist uses Spotify's real playback engine and does not have that problem.
+## Pick something to play through
 
-The panel sets it up for you. Open the device button, and under **Headless
-player**:
+Open the device button at the top right of the panel. Anything already
+running Spotify on your account is listed; click one to play there.
 
-1. **Set up Soloist…** downloads the current build into `~/.local/bin`,
-   installs a systemd user service plus a weekly updater (Soloist builds
-   expire 90 days after they are made), and creates
-   `~/.config/soloist/soloist.env`.
-2. Generate a key at <https://developer.spotify.com/dashboard> →
-   **Spotify Soloist API Key** → accept the terms → Generate. It is tied to
-   your Premium account; don't share it. Paste it into the field and press
-   **Start**.
-3. Pair once: open the Spotify app (desktop or phone, same network), open
-   its device picker, choose **Omarchy**. Soloist stores the session and
-   restores it on every restart.
+### Option A: the Spotify desktop app
 
-From then on the panel lists Omarchy under the device button, shows a
-**Start Soloist** button whenever the service is stopped, and pressing Play
-with no active device transfers playback to it. **Remove Soloist** undoes
-step 1 (the session and cache under `~/.local/share/soloist` and
-`~/.cache/soloist` are left for you to delete). Soloist also exposes a local
-WebSocket API and a `soloist ctl` command for scripting.
-
-Prefer the shell? The same files live in [`contrib/`](contrib/):
-`systemd/soloist.service`, `systemd/soloist-update.{service,timer}` go in
-`~/.config/systemd/user/`, `soloist-update` in `~/.local/bin/`, and
-`bin/spotify-bridge soloist install|key <key>|remove` does what the buttons do.
-
-### Or: keep the desktop app, just hide it
-
-If a background Spotify process is fine, the desktop app is the simplest
-device of all and needs no extra account step. Start it at login on a
-hidden special workspace with two lines of Omarchy's Hyprland Lua:
+Simplest. Install it with the panel's **Install Spotify** button (or
+`omarchy install service spotify`), open it once, and it appears in the
+list. If you'd rather never see its window, start it hidden at login by
+adding these two lines to your Hyprland Lua config:
 
 ```lua
 -- ~/.config/hypr/autostart.lua
 o.launch_on_start("spotify")
 
--- ~/.config/hypr/hyprland.lua (or any required module)
+-- ~/.config/hypr/hyprland.lua
 o.window("^(spotify|Spotify)$", { workspace = "special:spotify silent" })
 ```
 
-Then `hyprctl reload` and check `hyprctl configerrors`. The app runs, the
-panel drives it, and you never see its window unless you open that special
-workspace. Window-rule syntax moves between Hyprland versions, so confirm
-the `workspace` rule against the current Hyprland wiki if it complains.
+Run `hyprctl reload`, then `hyprctl configerrors` to be sure it took.
+
+### Option B: a headless player (no window, ever)
+
+Spotify publishes a small program called **Spotify Soloist** that plays
+music as a background service. The panel installs and runs it for you.
+Under the device button, in **Headless player**:
+
+1. Click **Set up Soloist…**. The panel downloads it, sets up the background
+   service, and adds a weekly refresh (Spotify's builds stop working after
+   90 days, so the refresh matters).
+2. Get a key from <https://developer.spotify.com/dashboard>: open
+   **Spotify Soloist API Key**, accept the terms, click Generate. Paste it
+   into the panel and click **Start**.
+3. Open the Spotify app on your phone or computer, open its device picker,
+   and choose **Omarchy** once. That pairs it. Soloist remembers the session
+   from then on.
+
+Now the panel lists Omarchy as a device, offers **Start Soloist** if it's
+ever stopped, and hands playback to it automatically when nothing else is
+playing. **Remove Soloist** takes it all out again.
+
+> **Why not spotifyd or librespot?** Since late 2025 Spotify refuses to give
+> those open-source players the keys to decode audio for accounts created in
+> the last couple of years. They connect, then skip every track in silence.
+> Soloist is Spotify's own engine, so it just works.
 
 ## Using it
 
 | Where | Action |
 |---|---|
-| Bar chip, left click | open / close the panel |
+| Bar chip, left click | open or close the panel |
 | Bar chip, middle click | play / pause |
 | Bar chip, right click | next track |
-| Bar chip, scroll | volume ±5 |
+| Bar chip, scroll | volume up / down |
 | Cover in the panel | play / pause |
-| Row, click | play (tracks, episodes, chapters, artists) or open (playlists, albums, podcasts, audiobooks) |
-| Row, right or middle click | add to queue |
-| Row, hover | reveals **+** (queue) and **▶** (play) buttons |
-| Device button | switch Spotify Connect device, launch the app, sign out |
+| A row, click | play it (tracks, episodes, chapters, artists) or open it (playlists, albums, podcasts, audiobooks) |
+| A row, right click | add to queue |
+| Hover a row | reveals **+** (queue) and **▶** (play) |
+| Device button | switch device, start or set up Soloist, sign out |
 
-Keyboard, while the panel is open:
+### Keyboard cheat sheet
 
-| Key | Action |
+| Key | Does |
 |---|---|
-| `j` / `k`, arrows | move the cursor |
-| `Enter` | open or play the row under the cursor |
+| `j` / `k` or arrows | move between rows |
+| `Enter` | open or play the highlighted row |
 | `Space` | play / pause |
 | `n` / `p` | next / previous |
-| `s` | toggle shuffle |
+| `s` | shuffle on / off |
 | `f` | save / unsave the current track |
-| `+` / `-` | volume ±5 |
-| `q` | add the row under the cursor to the queue |
-| `/` | focus the search field (`Esc` leaves it, `↓` jumps to results) |
-| `1` – `4`, `h` / `l` | switch tabs |
-| `h` or `Esc` | back out of a playlist / book / podcast |
+| `+` / `-` | volume up / down |
+| `q` | queue the highlighted row |
+| `/` | jump to the search box (`Esc` leaves it, `↓` jumps to results) |
+| `1` `2` `3` `4` or `h` / `l` | switch tabs |
+| `h` or `Esc` | go back out of a playlist, book or podcast |
 | `d` | devices |
 | `r` | refresh |
-| `Tab` / `Shift+Tab` | next / previous bar panel |
+| `Tab` / `Shift+Tab` | switch to the next / previous bar panel |
 | `Esc` | close |
 
 ## Settings
 
-Inline on the widget's entry in `~/.config/omarchy/shell.json`:
+These live on the widget's entry in `~/.config/omarchy/shell.json`. Change
+them with `omarchy bar set ninepointlabs.spotify <key> <value>`.
 
-| Key | Default | Meaning |
+| Key | Default | What it does |
 |---|---|---|
-| `clientId` | `""` | Your Spotify app's Client ID (the panel writes this for you). |
-| `redirectPort` | `8888` | Loopback port for the login redirect. |
+| `clientId` | `""` | Your developer app's Client ID. The panel fills this in. |
+| `redirectPort` | `8888` | The port in the redirect URI. Change both if 8888 is taken. |
 | `showTrack` | `true` | Show "Title · Artist" next to the cover in the bar. |
-| `maxLabelWidth` | `180` | Pixel width of that label before it scrolls. |
-| `defaultTab` | `"search"` | Tab the panel opens on; remembers the last one you picked. |
+| `maxLabelWidth` | `180` | How wide that text may get before it scrolls. |
+| `defaultTab` | `"search"` | Which tab opens first. Remembers the last one you used. |
+
+## If something's off
+
+- **"redirect_uri: Not matching configuration"** when connecting: the
+  redirect URI in your Spotify app is not exactly
+  `http://127.0.0.1:8888/callback`, or wasn't saved. Fix it, then click
+  Connect again.
+- **"No active device"**: nothing is playing Spotify right now. Open the
+  device button and pick one, launch the desktop app, or start Soloist.
+- **"Spotify Premium is required"**: the account you connected isn't
+  Premium. Spotify won't allow playback control without it.
+- **"Spotify rate limit hit"**: you clicked a lot very fast. It clears in a
+  few seconds.
+- **"Your Spotify session expired"**: six months passed. Click Connect.
+- **"Soloist build expired"**: the weekly refresh didn't run. Click
+  **Reinstall Soloist**, or run `soloist-update` in a terminal.
+- **Soloist starts but skips every track silently**: that's the librespot
+  problem above, which Soloist doesn't have. Make sure `spotifyd` or another
+  player isn't the active device.
+- **Panel says "Spotify only lists tracks for playlists you own"**: a
+  Spotify limit for playlists made by other people. Play still works.
+- Something else: run
+  `~/.config/omarchy/plugins/ninepointlabs.spotify/bin/spotify-bridge status`
+  in a terminal and look at what it prints, and `journalctl --user -u soloist`
+  for the headless player.
+
+## Uninstall
 
 ```sh
-omarchy bar set ninepointlabs.spotify showTrack false
+omarchy plugin remove ninepointlabs.spotify          # the plugin
+rm -rf ~/.local/state/omarchy-spotify ~/.cache/omarchy-spotify   # login and cover cache
 ```
+
+If you set up Soloist, click **Remove Soloist** in the panel first (or run
+`bin/spotify-bridge soloist remove`), then optionally
+`rm -rf ~/.config/soloist ~/.local/share/soloist ~/.cache/soloist`.
 
 ## Scripting
 
-Two IPC targets are registered:
+Two IPC targets are available while the shell runs:
 
 ```sh
-omarchy-shell ninepointlabs.spotify toggle      # open/close the panel
-omarchy-shell spotify playPause                 # also: next, previous, volumeUp, volumeDown, status
-omarchy-shell spotify status                    # JSON: playing, title, artist, device, progress
+omarchy-shell ninepointlabs.spotify toggle   # open/close the panel
+omarchy-shell spotify playPause              # also next, previous, volumeUp, volumeDown
+omarchy-shell spotify status                 # JSON: playing, title, artist, device, progress
 ```
 
-Bind them in `~/.config/hypr/bindings.lua` if you want media keys without
-the panel. The `bin/spotify-bridge` helper is a plain CLI too — run it with
-`--help` to explore.
+Bind them in `~/.config/hypr/bindings.lua` for media keys. The helper
+`bin/spotify-bridge` is a normal command-line tool too; `--help` lists
+everything it can do.
 
-## How it works
+## How it's built
 
-- `bin/spotify-bridge` (Python, stdlib only) does every request: PKCE login,
-  token refresh, player state and control, library reads, search, and
-  cover-art caching under `~/.cache/omarchy-spotify/art`. Each call prints
-  one JSON envelope so the shell never touches HTTP.
-- `Service.qml` is the single per-shell instance the widgets and panels
-  share. It polls the player every 4 s while the panel is open, every 15 s
-  while something plays with the panel closed, and every 60 s when idle;
-  progress is interpolated locally between polls. Actions apply
-  optimistically and re-poll shortly after.
-- `BarWidget.qml` is the chip; `Panel.qml` is the popup, built on the shell's
-  `KeyboardPanel` / `PanelKeyCatcher` so it matches the stock panels. Every
-  tab renders into one flat row list, which is what lets a single cursor
-  walk Search, Playlists, Books and Podcasts alike.
-- Spotify's February 2026 development-mode rules shape a few things: search
-  returns at most 10 per type, other people's playlists expose no track list
-  (Play still works), and there are no browse or recommendation feeds.
+- `bin/spotify-bridge` is a Python script (standard library only) that does
+  all the talking to Spotify: the login, playback control, your library,
+  search, and caching cover art under `~/.cache/omarchy-spotify`. Your login
+  is kept in `~/.local/state/omarchy-spotify/auth.json`, readable only by
+  you. No client secret is involved.
+- `Service.qml` runs once per shell and keeps the state everything else
+  reads. It checks the player every 4 seconds while the panel is open, every
+  15 while something plays with the panel closed, and every minute when idle.
+- `BarWidget.qml` is the chip, `Panel.qml` the popup. They use the same
+  building blocks as Omarchy's own panels, so they follow your theme.
+- `contrib/` holds the systemd units and updater the Soloist setup installs.
+
+Spotify's February 2026 rules for apps like this one shape a few things:
+search shows at most 10 results per type, other people's playlists don't
+expose their track lists, and the connection must be renewed every six months.
 
 ## License
 
-MIT — see `LICENSE`.
+MIT. See `LICENSE`.
