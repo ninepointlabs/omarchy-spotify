@@ -560,20 +560,34 @@ def norm_device(d):
 
 # -------------------------------------------------------------- subcommands
 
+def quiet_ok(argv):
+    try:
+        return subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3).returncode == 0
+    except Exception:
+        return False
+
+
 def app_state():
+    """The desktop app and the headless spotifyd daemon are the two local
+    Spotify Connect devices the panel knows how to start."""
     binary = shutil.which("spotify") or shutil.which("spotify-launcher") or ""
-    running = False
-    if binary:
-        try:
-            running = subprocess.run(["pgrep", "-x", "spotify"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3).returncode == 0
-        except Exception:
-            running = False
-    return binary, running
+    running = bool(binary) and quiet_ok(["pgrep", "-x", "spotify"])
+    daemon = shutil.which("spotifyd") or ""
+    daemon_running = bool(daemon) and quiet_ok(["systemctl", "--user", "is-active", "--quiet", "spotifyd"])
+    daemon_authenticated = bool(daemon) and os.path.exists(
+        os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "spotifyd", "oauth", "credentials.json"))
+    return {
+        "appBinary": binary,
+        "appInstalled": bool(binary),
+        "appRunning": running,
+        "daemonInstalled": bool(daemon),
+        "daemonRunning": daemon_running,
+        "daemonAuthenticated": daemon_authenticated,
+    }
 
 
 def cmd_status(args):
     auth = load_auth()
-    binary, running = app_state()
     data = {
         "configured": bool(auth.get("client_id")),
         "clientId": auth.get("client_id", ""),
@@ -582,12 +596,30 @@ def cmd_status(args):
         "needsReauth": bool(auth.get("needs_reauth")),
         "user": auth.get("user") or {},
         "authorizedAt": auth.get("authorized_at", 0),
-        "appBinary": binary,
-        "appInstalled": bool(binary),
-        "appRunning": running,
         "lastPlayed": load_last(),
     }
+    data.update(app_state())
     out(data)
+
+
+def cmd_daemon(args):
+    """Start/stop the spotifyd user service so the panel has a device."""
+    if not shutil.which("spotifyd"):
+        return fail("no_daemon", "spotifyd is not installed (omarchy pkg add spotifyd)")
+    verb = args.action
+    if verb == "start":
+        ok = quiet_ok(["systemctl", "--user", "start", "spotifyd"])
+        if ok:
+            quiet_ok(["systemctl", "--user", "enable", "--quiet", "spotifyd"])
+    elif verb == "stop":
+        ok = quiet_ok(["systemctl", "--user", "stop", "spotifyd"])
+    elif verb == "restart":
+        ok = quiet_ok(["systemctl", "--user", "restart", "spotifyd"])
+    else:
+        return fail("bad_args", "daemon action must be start, stop, or restart")
+    if not ok:
+        return fail("daemon_failed", "systemctl --user %s spotifyd failed — check `journalctl --user -u spotifyd`" % verb)
+    out(app_state())
 
 
 class CallbackHandler(BaseHTTPRequestHandler):
@@ -1012,6 +1044,7 @@ def build_parser():
     p.set_defaults(fn=cmd_auth)
     sub.add_parser("logout").set_defaults(fn=cmd_logout)
     sub.add_parser("me").set_defaults(fn=cmd_me)
+    p = sub.add_parser("daemon"); p.add_argument("action"); p.set_defaults(fn=cmd_daemon)
 
     sub.add_parser("player").set_defaults(fn=cmd_player)
     sub.add_parser("devices").set_defaults(fn=cmd_devices)

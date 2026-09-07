@@ -91,7 +91,8 @@ Panel {
     if (!authenticated) return ""
     if (service.premiumRequired) return "Spotify Premium is required for playback control"
     if (playerActive && service.deviceName !== "") return (isPlaying ? "Playing on " : "Paused on ") + service.deviceName
-    if (service.noDevice) return "No active device — pick one or launch Spotify"
+    if (service.daemonInstalled && !service.daemonRunning) return "spotifyd isn't running — start it to play here"
+    if (service.noDevice) return "No active device — pick one or start a player"
     if (service.user && service.user.name) return "Connected as " + service.user.name
     return "Connected"
   }
@@ -624,7 +625,7 @@ Panel {
             }
 
             Column {
-              visible: root.service && !root.service.appInstalled
+              visible: root.service && !root.service.hasLocalDevice
               width: parent.width
               spacing: Style.space(6)
               topPadding: Style.space(4)
@@ -633,7 +634,7 @@ Panel {
 
               Text {
                 width: parent.width
-                text: "The Spotify desktop app is the device this panel plays through. It isn't installed yet."
+                text: "This panel needs a player to drive: the Spotify desktop app, or the headless spotifyd daemon (omarchy pkg add spotifyd). Neither is installed yet."
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
@@ -907,6 +908,22 @@ Panel {
               spacing: Style.space(8)
 
               Button {
+                visible: root.service && root.service.daemonInstalled && !root.service.daemonRunning
+                text: "Start spotifyd"
+                iconText: Model.glyph.play
+                bordered: true
+                foreground: root.foreground
+                background: Color.popups.background
+                accent: root.accent
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                iconSize: Style.font.body
+                horizontalPadding: Style.space(10)
+                verticalPadding: Style.space(4)
+                onClicked: if (root.service) root.service.startDaemon()
+              }
+
+              Button {
                 visible: root.service && root.service.appInstalled
                 text: root.service && root.service.appRunning ? "Focus Spotify app" : "Launch Spotify app"
                 iconText: Model.glyph.external
@@ -926,7 +943,7 @@ Panel {
               }
 
               Button {
-                visible: root.service && !root.service.appInstalled
+                visible: root.service && !root.service.hasLocalDevice
                 text: "Install Spotify app…"
                 bordered: true
                 foreground: root.foreground
@@ -1005,6 +1022,19 @@ Panel {
               spacing: Style.space(6)
               topPadding: Style.space(2)
 
+              Button {
+                visible: root.service && root.service.daemonInstalled
+                text: root.service && root.service.daemonRunning ? "Restart spotifyd" : "Start spotifyd"
+                iconText: Model.glyph.play
+                foreground: root.foreground
+                accent: root.accent
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                iconSize: Style.font.bodySmall
+                horizontalPadding: Style.space(8)
+                verticalPadding: Style.space(3)
+                onClicked: if (root.service) root.service.startDaemon()
+              }
               Button {
                 visible: root.service && root.service.appInstalled
                 text: "Launch app"

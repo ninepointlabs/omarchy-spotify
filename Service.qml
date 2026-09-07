@@ -36,6 +36,11 @@ Item {
   property bool needsReauth: false
   property bool appInstalled: false
   property bool appRunning: false
+  // spotifyd: the headless Spotify Connect device, run as a systemd user service.
+  property bool daemonInstalled: false
+  property bool daemonRunning: false
+  property bool daemonAuthenticated: false
+  readonly property bool hasLocalDevice: appInstalled || daemonInstalled
   property string storedClientId: ""
   property var user: ({})
   property string lastError: ""
@@ -201,6 +206,9 @@ Item {
       root.authenticated = d.authenticated === true
       root.appInstalled = d.appInstalled === true
       root.appRunning = d.appRunning === true
+      root.daemonInstalled = d.daemonInstalled === true
+      root.daemonRunning = d.daemonRunning === true
+      root.daemonAuthenticated = d.daemonAuthenticated === true
       root.user = d.user || {}
       root.lastPlayed = d.lastPlayed || {}
       if (root.authenticated) {
@@ -515,6 +523,15 @@ Item {
     Quickshell.execDetached(["bash", "-lc", "setsid uwsm-app -- spotify >/dev/null 2>&1 &"])
     flash("Launching Spotify…", false)
     appLaunchTimer.restart()
+  }
+
+  function startDaemon() {
+    call(["daemon", "start"], function(result) {
+      if (!result.ok) { root.flash(result.error, true); return }
+      root.daemonRunning = result.data.daemonRunning === true
+      root.flash(root.daemonRunning ? "spotifyd started" : "spotifyd did not stay up — see journalctl --user -u spotifyd", !root.daemonRunning)
+      appLaunchTimer.restart()
+    })
   }
 
   Timer {

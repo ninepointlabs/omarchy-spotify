@@ -70,6 +70,34 @@ picks up where you left off. **Sign out** lives under the device button.
 If port 8888 is taken, change `redirectPort` in the widget's settings and use
 the matching redirect URI in the Spotify dashboard.
 
+## Playing without the Spotify app open
+
+The Web API only steers a Spotify Connect device; it never plays audio
+itself. [spotifyd](https://spotifyd.rs) is a headless Connect device that
+runs as a systemd user service, so the panel works with no window anywhere:
+
+```sh
+omarchy pkg add spotifyd                   # Arch extra repo
+mkdir -p ~/.config/spotifyd
+cat > ~/.config/spotifyd/spotifyd.conf <<'EOF'
+[global]
+device_name = "My Omarchy box"
+device_type = "computer"
+backend = "pulseaudio"                    # PipeWire's Pulse server
+bitrate = 320
+cache_path = "/home/YOU/.cache/spotifyd"  # absolute; the login lives here
+use_mpris = true
+dbus_type = "session"
+EOF
+spotifyd authenticate                      # one-time browser login
+systemctl --user enable --now spotifyd
+```
+
+The panel detects it: a **Start spotifyd** button appears whenever the
+service is stopped, and pressing Play with no active device transfers
+playback to it automatically. It also speaks MPRIS, so `playerctl` and the
+stock `omarchy.media` widget see it. Spotify Premium is required.
+
 ## Using it
 
 | Where | Action |
