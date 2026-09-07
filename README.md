@@ -270,6 +270,17 @@ expose their track lists, and the connection must be renewed every six months.
 - **Nothing phones home.** The plugin talks to `api.spotify.com`,
   `accounts.spotify.com`, Spotify's image CDN, and the Soloist download
   host. That's the full list.
+- **It manages a user service, only if you ask.** Nothing touches systemd
+  until you click **Set up Soloist…**. That step copies three units from
+  `contrib/systemd/` into `~/.config/systemd/user/` (`soloist.service`,
+  `soloist-update.service`, `soloist-update.timer`), runs
+  `systemctl --user daemon-reload`, and enables them. Everything is
+  `--user` scope; the plugin never touches system units and never asks for
+  root. **Start Soloist**, **Stop**, and **Restart** in the panel map to
+  `systemctl --user start|stop|restart soloist`, and **Remove Soloist**
+  disables the units, deletes those three files, and reloads. `install.sh`
+  itself only copies the plugin files into place; it does not install or
+  start any service.
 
 ## License
 
