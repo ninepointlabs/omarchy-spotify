@@ -1180,12 +1180,14 @@ def cmd_library_contains(args):
 
 
 def cmd_library_save(args):
-    api("PUT", "/me/library", None, {"uris": list(args.uris)})
+    # The 2026 library endpoints take the URIs as a query parameter; a JSON
+    # body is answered with "Missing required field: uris".
+    api("PUT", "/me/library", {"uris": ",".join(args.uris)})
     out({"saved": list(args.uris)})
 
 
 def cmd_library_remove(args):
-    api("DELETE", "/me/library", None, {"uris": list(args.uris)})
+    api("DELETE", "/me/library", {"uris": ",".join(args.uris)})
     out({"removed": list(args.uris)})
 
 
