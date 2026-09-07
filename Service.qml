@@ -530,6 +530,58 @@ Item {
     appLaunchTimer.restart()
   }
 
+  // ---- One-button Soloist setup (download + units + key), driven from the panel.
+  property bool soloistBusy: false
+  property string soloistError: ""
+
+  function applyDaemonState(d) {
+    daemonInstalled = d.daemonInstalled === true
+    daemonConfigured = d.daemonConfigured === true
+    daemonRunning = d.daemonRunning === true
+    daemonExpired = d.daemonExpired === true
+    daemonPaired = d.daemonPaired === true
+    appInstalled = d.appInstalled === true
+    appRunning = d.appRunning === true
+  }
+
+  function installSoloist() {
+    if (soloistBusy) return
+    soloistBusy = true
+    soloistError = ""
+    call(["soloist", "install"], function(result) {
+      root.soloistBusy = false
+      if (!result.ok) { root.soloistError = result.error; return }
+      root.applyDaemonState(result.data)
+      root.flash("Soloist installed — paste your API key", false)
+    })
+  }
+
+  function setSoloistKey(key) {
+    var k = String(key || "").trim()
+    if (k === "") { soloistError = "Paste the Soloist API key first."; return }
+    if (soloistBusy) return
+    soloistBusy = true
+    soloistError = ""
+    call(["soloist", "key", k], function(result) {
+      root.soloistBusy = false
+      if (!result.ok) { root.soloistError = result.error; if (result.daemonInstalled !== undefined) root.applyDaemonState(result); return }
+      root.applyDaemonState(result.data)
+      root.flash(root.daemonPaired ? "Soloist is running" : "Soloist is running — pick “Omarchy” once in the Spotify app", false)
+      appLaunchTimer.restart()
+    })
+  }
+
+  function removeSoloist() {
+    if (soloistBusy) return
+    soloistBusy = true
+    call(["soloist", "remove"], function(result) {
+      root.soloistBusy = false
+      if (!result.ok) { root.soloistError = result.error; return }
+      root.applyDaemonState(result.data)
+      root.flash("Soloist removed", false)
+    })
+  }
+
   function startDaemon() {
     call(["daemon", "start"], function(result) {
       if (!result.ok) { root.flash(result.error, true); return }

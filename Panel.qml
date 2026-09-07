@@ -379,7 +379,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: searchField.activeFocus || clientIdField.activeFocus
+      blocked: searchField.activeFocus || clientIdField.activeFocus || soloistKeyField.activeFocus
       onMoveRequested: function(dx, dy) {
         if (dy !== 0) root.moveCursor(dy)
         else if (dx < 0 && root.detailOpen) root.goBack()
@@ -960,6 +960,20 @@ Panel {
               }
 
               Button {
+                visible: root.service && !root.service.daemonRunning
+                text: root.service && root.service.daemonInstalled ? "Headless player…" : "Play without a window…"
+                bordered: true
+                foreground: root.foreground
+                background: Color.popups.background
+                accent: root.accent
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                horizontalPadding: Style.space(10)
+                verticalPadding: Style.space(4)
+                onClicked: { if (!root.deviceMenuOpen) root.toggleDevices() }
+              }
+
+              Button {
                 text: "Pick a device"
                 bordered: true
                 foreground: root.foreground
@@ -1074,6 +1088,111 @@ Panel {
                 horizontalPadding: Style.space(8)
                 verticalPadding: Style.space(3)
                 onClicked: { root.deviceMenuOpen = false; if (root.service) root.service.signOut() }
+              }
+            }
+
+            // ---- Headless player: Spotify Soloist, set up from here in
+            //      two pastes (install, then the account's API key).
+            PanelSectionHeader {
+              topPadding: Style.space(8)
+              text: "HEADLESS PLAYER"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Text {
+              width: parent.width
+              wrapMode: Text.Wrap
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              text: {
+                if (!root.service) return ""
+                if (!root.service.daemonInstalled) return "Spotify Soloist plays with no window: Spotify's own headless Connect device, run as a background service. Premium required."
+                if (!root.service.daemonConfigured) return "Installed. Now generate a key at developer.spotify.com/dashboard → “Spotify Soloist API Key”, and paste it here."
+                if (root.service.daemonExpired) return "The Soloist build expired. Reinstall to fetch the current one."
+                if (!root.service.daemonRunning) return "Soloist is installed but stopped."
+                if (!root.service.daemonPaired) return "Soloist is running as “Omarchy”. Pick it once in the Spotify app's device picker to pair; after that it appears above."
+                return "Soloist is running as “Omarchy”."
+              }
+            }
+
+            Text {
+              visible: root.service && root.service.soloistError !== ""
+              width: parent.width
+              wrapMode: Text.Wrap
+              text: root.service ? root.service.soloistError : ""
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            Row {
+              visible: root.service && root.service.daemonInstalled && !root.service.daemonConfigured
+              width: parent.width
+              spacing: Style.space(8)
+
+              TextField {
+                id: soloistKeyField
+                width: parent.width - soloistKeyButton.width - parent.spacing
+                placeholderText: "Soloist API key"
+                password: true
+                foreground: root.foreground
+                accent: root.accent
+                font.family: root.fontFamily
+                verticalPadding: Style.space(5)
+                enabled: !(root.service && root.service.soloistBusy)
+                Keys.onReturnPressed: if (root.service) root.service.setSoloistKey(text)
+                Keys.onEscapePressed: keyCatcher.forceActiveFocus()
+              }
+
+              Button {
+                id: soloistKeyButton
+                text: root.service && root.service.soloistBusy ? "Starting…" : "Start"
+                bordered: true
+                foreground: root.foreground
+                background: Color.popups.background
+                accent: root.accent
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                horizontalPadding: Style.spacing.controlPaddingX
+                verticalPadding: Style.space(4)
+                anchors.verticalCenter: parent.verticalCenter
+                onClicked: if (root.service) root.service.setSoloistKey(soloistKeyField.text)
+              }
+            }
+
+            Row {
+              spacing: Style.space(6)
+
+              Button {
+                visible: root.service && (!root.service.daemonInstalled || root.service.daemonExpired)
+                text: root.service && root.service.soloistBusy ? "Downloading…" : (root.service && root.service.daemonExpired ? "Reinstall Soloist" : "Set up Soloist…")
+                iconText: Model.glyph.external
+                bordered: true
+                foreground: root.foreground
+                background: Color.popups.background
+                accent: root.accent
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                iconSize: Style.font.body
+                horizontalPadding: Style.space(10)
+                verticalPadding: Style.space(4)
+                enabled: !(root.service && root.service.soloistBusy)
+                onClicked: if (root.service) root.service.installSoloist()
+              }
+
+              Button {
+                visible: root.service && root.service.daemonInstalled && root.service.daemonConfigured
+                text: "Remove Soloist"
+                foreground: root.foreground
+                accent: root.accent
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                horizontalPadding: Style.space(8)
+                verticalPadding: Style.space(3)
+                enabled: !(root.service && root.service.soloistBusy)
+                onClicked: if (root.service) root.service.removeSoloist()
               }
             }
           }

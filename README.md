@@ -83,41 +83,51 @@ Run it as a systemd user service and the panel works with no window anywhere.
 > ([librespot#1649](https://github.com/librespot-org/librespot/issues/1649)).
 > Soloist uses Spotify's real playback engine and does not have that problem.
 
-1. Generate an API key: <https://developer.spotify.com/dashboard> →
+The panel sets it up for you. Open the device button, and under **Headless
+player**:
+
+1. **Set up Soloist…** downloads the current build into `~/.local/bin`,
+   installs a systemd user service plus a weekly updater (Soloist builds
+   expire 90 days after they are made), and creates
+   `~/.config/soloist/soloist.env`.
+2. Generate a key at <https://developer.spotify.com/dashboard> →
    **Spotify Soloist API Key** → accept the terms → Generate. It is tied to
-   your (Premium) account; don't share it.
-2. Install the binary, service and weekly updater (Soloist builds expire 90
-   days after they are made, exit code 10):
-
-```sh
-curl -fsSL -o /tmp/soloist.tar.gz https://soloist-builds.spotifycdn.com/soloist_release_x86_64.tar.gz
-tar -xzf /tmp/soloist.tar.gz -C /tmp soloist && install -m 755 /tmp/soloist ~/.local/bin/soloist
-mkdir -p ~/.config/soloist
-cat > ~/.config/soloist/soloist.env <<'EOF'
-SOLOIST_API_KEY=paste-your-key-here
-SOLOIST_DEVICE_NAME=Omarchy
-EOF
-chmod 600 ~/.config/soloist/soloist.env
-```
-
-   Unit files for `soloist.service`, `soloist-update.service` and
-   `soloist-update.timer` are in [`contrib/systemd/`](contrib/systemd/);
-   copy them to `~/.config/systemd/user/` together with
-   [`contrib/soloist-update`](contrib/soloist-update) in `~/.local/bin/`, then:
-
-```sh
-systemctl --user daemon-reload
-systemctl --user enable --now soloist soloist-update.timer
-```
-
+   your Premium account; don't share it. Paste it into the field and press
+   **Start**.
 3. Pair once: open the Spotify app (desktop or phone, same network), open
-   the device picker, choose **Omarchy**. Soloist stores the session and
+   its device picker, choose **Omarchy**. Soloist stores the session and
    restores it on every restart.
 
 From then on the panel lists Omarchy under the device button, shows a
 **Start Soloist** button whenever the service is stopped, and pressing Play
-with no active device transfers playback to it. Soloist also exposes a local
+with no active device transfers playback to it. **Remove Soloist** undoes
+step 1 (the session and cache under `~/.local/share/soloist` and
+`~/.cache/soloist` are left for you to delete). Soloist also exposes a local
 WebSocket API and a `soloist ctl` command for scripting.
+
+Prefer the shell? The same files live in [`contrib/`](contrib/):
+`systemd/soloist.service`, `systemd/soloist-update.{service,timer}` go in
+`~/.config/systemd/user/`, `soloist-update` in `~/.local/bin/`, and
+`bin/spotify-bridge soloist install|key <key>|remove` does what the buttons do.
+
+### Or: keep the desktop app, just hide it
+
+If a background Spotify process is fine, the desktop app is the simplest
+device of all and needs no extra account step. Start it at login on a
+hidden special workspace with two lines of Omarchy's Hyprland Lua:
+
+```lua
+-- ~/.config/hypr/autostart.lua
+o.launch_on_start("spotify")
+
+-- ~/.config/hypr/hyprland.lua (or any required module)
+o.window("^(spotify|Spotify)$", { workspace = "special:spotify silent" })
+```
+
+Then `hyprctl reload` and check `hyprctl configerrors`. The app runs, the
+panel drives it, and you never see its window unless you open that special
+workspace. Window-rule syntax moves between Hyprland versions, so confirm
+the `workspace` rule against the current Hyprland wiki if it complains.
 
 ## Using it
 

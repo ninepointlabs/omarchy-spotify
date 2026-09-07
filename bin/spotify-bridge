@@ -645,6 +645,120 @@ def cmd_status(args):
     out(data)
 
 
+PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SOLOIST_BIN = os.path.join(HOME, ".local", "bin", "soloist")
+SOLOIST_UPDATER = os.path.join(HOME, ".local", "bin", "soloist-update")
+SYSTEMD_USER_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "systemd", "user")
+SOLOIST_UNITS = ["soloist.service", "soloist-update.service", "soloist-update.timer"]
+SOLOIST_ARCHES = {"x86_64": "x86_64", "aarch64": "arm64", "armv7l": "arm32"}
+
+
+def write_soloist_env(key=None, device_name=None):
+    """Create or update ~/.config/soloist/soloist.env, keeping other lines."""
+    lines = []
+    if os.path.exists(SOLOIST_ENV):
+        with open(SOLOIST_ENV, "r", encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    else:
+        lines = [
+            "# Spotify Soloist — read by ~/.config/systemd/user/soloist.service",
+            "# SOLOIST_API_KEY comes from https://developer.spotify.com/dashboard →",
+            "# \"Spotify Soloist API Key\". It is tied to your account; keep this file private.",
+            "SOLOIST_API_KEY=",
+            "SOLOIST_DEVICE_NAME=Omarchy",
+        ]
+    def put(name, value):
+        for i, line in enumerate(lines):
+            if line.startswith(name + "="):
+                lines[i] = "%s=%s" % (name, value)
+                return
+        lines.append("%s=%s" % (name, value))
+    if key is not None:
+        put("SOLOIST_API_KEY", key)
+    if device_name is not None:
+        put("SOLOIST_DEVICE_NAME", device_name)
+    os.makedirs(os.path.dirname(SOLOIST_ENV), mode=0o700, exist_ok=True)
+    fd = os.open(SOLOIST_ENV + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    os.replace(SOLOIST_ENV + ".tmp", SOLOIST_ENV)
+
+
+def download_soloist(dest):
+    import tarfile
+    import tempfile
+    arch = SOLOIST_ARCHES.get(os.uname().machine)
+    if not arch:
+        raise ApiError("unsupported", "Soloist has no build for %s" % os.uname().machine)
+    url = "https://soloist-builds.spotifycdn.com/soloist_release_%s.tar.gz" % arch
+    with tempfile.TemporaryDirectory() as tmp:
+        archive = os.path.join(tmp, "soloist.tar.gz")
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp, open(archive, "wb") as fh:
+                shutil.copyfileobj(resp, fh)
+        except Exception as err:
+            raise ApiError("download_failed", "Could not download Soloist: %s" % err)
+        with tarfile.open(archive, "r:gz") as tar:
+            member = tar.getmember("soloist")
+            tar.extract(member, tmp)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copyfile(os.path.join(tmp, "soloist"), dest + ".tmp")
+        os.chmod(dest + ".tmp", 0o755)
+        os.replace(dest + ".tmp", dest)
+
+
+def cmd_soloist(args):
+    """One-button Soloist setup: install/update the binary, service units and
+    updater; store the API key; remove everything again."""
+    verb = args.action
+    if verb == "install":
+        download_soloist(SOLOIST_BIN)
+        contrib = os.path.join(PLUGIN_DIR, "contrib")
+        os.makedirs(SYSTEMD_USER_DIR, exist_ok=True)
+        for unit in SOLOIST_UNITS:
+            shutil.copyfile(os.path.join(contrib, "systemd", unit), os.path.join(SYSTEMD_USER_DIR, unit))
+        shutil.copyfile(os.path.join(contrib, "soloist-update"), SOLOIST_UPDATER)
+        os.chmod(SOLOIST_UPDATER, 0o755)
+        if not os.path.exists(SOLOIST_ENV):
+            write_soloist_env(device_name=args.device_name or "Omarchy")
+        elif args.device_name:
+            write_soloist_env(device_name=args.device_name)
+        systemctl_user("daemon-reload")
+        systemctl_user("enable", "--now", "--quiet", "soloist-update.timer")
+        out(app_state())
+    elif verb == "key":
+        key = (args.value or "").strip()
+        if not key:
+            return fail("bad_args", "Paste the Soloist API key first")
+        if not os.path.exists(SOLOIST_BIN):
+            return fail("no_daemon", "Install Soloist first")
+        write_soloist_env(key=key)
+        systemctl_user("daemon-reload")
+        code, _ = systemctl_user("enable", "--now", "soloist")
+        time.sleep(1.5)
+        state = app_state()
+        if code != 0 or not state["daemonRunning"]:
+            return fail("daemon_failed", "Soloist did not start — check `journalctl --user -u soloist`", state)
+        out(state)
+    elif verb == "remove":
+        systemctl_user("disable", "--now", "--quiet", "soloist", "soloist-update.timer")
+        for unit in SOLOIST_UNITS:
+            try:
+                os.remove(os.path.join(SYSTEMD_USER_DIR, unit))
+            except OSError:
+                pass
+        for path in (SOLOIST_BIN, SOLOIST_UPDATER):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        systemctl_user("daemon-reload")
+        out(app_state())
+    else:
+        return fail("bad_args", "soloist action must be install, key, or remove")
+
+
 def cmd_daemon(args):
     """Start/stop the Soloist user service so the panel has a device."""
     state = soloist_state()
@@ -1092,6 +1206,8 @@ def build_parser():
     sub.add_parser("logout").set_defaults(fn=cmd_logout)
     sub.add_parser("me").set_defaults(fn=cmd_me)
     p = sub.add_parser("daemon"); p.add_argument("action"); p.set_defaults(fn=cmd_daemon)
+    p = sub.add_parser("soloist"); p.add_argument("action"); p.add_argument("value", nargs="?", default="")
+    p.add_argument("--device-name", default=""); p.set_defaults(fn=cmd_soloist)
 
     sub.add_parser("player").set_defaults(fn=cmd_player)
     sub.add_parser("devices").set_defaults(fn=cmd_devices)
