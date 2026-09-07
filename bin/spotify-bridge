@@ -1,0 +1,1071 @@
+#!/usr/bin/env python3
+"""spotify-bridge — the Spotify Web API helper behind the Omarchy Spotify plugin.
+
+The QML side never talks HTTP itself. It runs this script with one subcommand
+per request and reads exactly one JSON object from stdout:
+
+    {"ok": true,  "data": ...}
+    {"ok": false, "code": "<machine code>", "error": "<human text>"}
+
+Handled failures (no device, rate limit, signed out, ...) still exit 0 so the
+shell can branch on `code`; only an unexpected crash exits non-zero.
+
+Auth is the PKCE flow (no client secret). Tokens live in
+$XDG_STATE_HOME/omarchy-spotify/auth.json (0600). Cover art is cached under
+$XDG_CACHE_HOME/omarchy-spotify/art so panel lists load from disk.
+
+Only Python's standard library is used.
+"""
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import secrets
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+API = "https://api.spotify.com/v1"
+ACCOUNTS = "https://accounts.spotify.com"
+USER_AGENT = "omarchy-spotify/0.1 (+https://github.com/ninepointlabs/omarchy-spotify)"
+
+SCOPES = [
+    "user-read-playback-state",
+    "user-modify-playback-state",
+    "user-read-currently-playing",
+    "user-read-recently-played",
+    "user-library-read",
+    "user-library-modify",
+    "playlist-read-private",
+    "playlist-read-collaborative",
+]
+
+HOME = os.path.expanduser("~")
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state"), "omarchy-spotify")
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "omarchy-spotify", "art")
+AUTH_PATH = os.path.join(STATE_DIR, "auth.json")
+LAST_PATH = os.path.join(STATE_DIR, "last-played.json")
+
+HTTP_TIMEOUT = 15
+ART_TIMEOUT = 8
+ART_WORKERS = 8
+
+
+# --------------------------------------------------------------------- output
+
+def out(data):
+    sys.stdout.write(json.dumps({"ok": True, "data": data}, ensure_ascii=False))
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def fail(code, message, extra=None):
+    payload = {"ok": False, "code": code, "error": message}
+    if extra:
+        payload.update(extra)
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False))
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+class ApiError(Exception):
+    def __init__(self, code, message, status=0, retry_after=0):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status = status
+        self.retry_after = retry_after
+
+
+# ---------------------------------------------------------------- auth store
+
+def load_auth():
+    try:
+        with open(AUTH_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_auth(auth):
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    tmp = AUTH_PATH + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(auth, fh)
+    os.replace(tmp, AUTH_PATH)
+
+
+def clear_auth():
+    try:
+        os.remove(AUTH_PATH)
+    except OSError:
+        pass
+
+
+def load_last():
+    try:
+        with open(LAST_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def remember_last(item):
+    """Keep the most recent item with artwork so the bar chip can show its
+    cover before the first poll after a shell restart, and while idle."""
+    if not item or not item.get("artPath"):
+        return
+    previous = load_last()
+    if previous.get("uri") == item.get("uri") and previous.get("artPath") == item.get("artPath"):
+        return
+    try:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        tmp = LAST_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"uri": item.get("uri", ""), "name": item.get("name", ""),
+                       "subtitle": item.get("artists") or item.get("show") or item.get("book") or "",
+                       "art": item.get("art", ""), "artPath": item["artPath"]}, fh)
+        os.replace(tmp, LAST_PATH)
+    except OSError:
+        pass
+
+
+def mask(value):
+    value = str(value or "")
+    if len(value) <= 8:
+        return "•" * len(value)
+    return value[:4] + "…" + value[-4:]
+
+
+# ------------------------------------------------------------------ http core
+
+def http(method, url, headers=None, data=None, timeout=HTTP_TIMEOUT):
+    """Return (status, body_text, headers). Never raises for HTTP status codes."""
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("User-Agent", USER_AGENT)
+    for key, value in (headers or {}).items():
+        req.add_header(key, value)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8", "replace"), dict(resp.headers)
+    except urllib.error.HTTPError as err:
+        body = err.read().decode("utf-8", "replace") if err.fp else ""
+        return err.code, body, dict(err.headers or {})
+    except urllib.error.URLError as err:
+        raise ApiError("network", "Spotify is unreachable: %s" % getattr(err, "reason", err))
+    except (TimeoutError, OSError) as err:
+        raise ApiError("network", "Spotify request timed out (%s)" % err)
+
+
+def token_request(form):
+    body = urllib.parse.urlencode(form).encode("utf-8")
+    status, text, _ = http("POST", ACCOUNTS + "/api/token",
+                           {"Content-Type": "application/x-www-form-urlencoded"}, body)
+    try:
+        payload = json.loads(text) if text else {}
+    except ValueError:
+        payload = {}
+    if status != 200:
+        code = payload.get("error", "token_error")
+        desc = payload.get("error_description") or ("Token request failed (HTTP %d)" % status)
+        raise ApiError(code, desc, status)
+    return payload
+
+
+def store_tokens(auth, payload):
+    auth["access_token"] = payload.get("access_token", "")
+    if payload.get("refresh_token"):
+        auth["refresh_token"] = payload["refresh_token"]
+    auth["expires_at"] = time.time() + float(payload.get("expires_in", 3600))
+    auth["scope"] = payload.get("scope", auth.get("scope", ""))
+    auth.pop("needs_reauth", None)
+    save_auth(auth)
+
+
+def access_token(auth, force_refresh=False):
+    if not auth.get("refresh_token"):
+        raise ApiError("signed_out", "Not connected to Spotify")
+    if auth.get("needs_reauth"):
+        raise ApiError("reauth", "Spotify session expired — connect again")
+    if not force_refresh and auth.get("access_token") and time.time() < float(auth.get("expires_at", 0)) - 45:
+        return auth["access_token"]
+    try:
+        payload = token_request({
+            "grant_type": "refresh_token",
+            "refresh_token": auth["refresh_token"],
+            "client_id": auth.get("client_id", ""),
+        })
+    except ApiError as err:
+        if err.code in ("invalid_grant", "invalid_client", "unauthorized_client"):
+            auth["needs_reauth"] = True
+            save_auth(auth)
+            raise ApiError("reauth", "Spotify session expired — connect again")
+        raise
+    store_tokens(auth, payload)
+    return auth["access_token"]
+
+
+def api(method, path, params=None, body=None, auth=None, _retried=False):
+    """Call the Web API. Returns parsed JSON, or None for empty (204) replies."""
+    if auth is None:
+        auth = load_auth()
+    token = access_token(auth)
+    url = API + path
+    if params:
+        clean = {k: v for k, v in params.items() if v is not None and v != ""}
+        if clean:
+            url += "?" + urllib.parse.urlencode(clean)
+    headers = {"Authorization": "Bearer " + token}
+    data = None
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(body).encode("utf-8")
+    status, text, resp_headers = http(method, url, headers, data)
+
+    if status in (200, 201, 202, 204):
+        if not text.strip():
+            return None
+        try:
+            return json.loads(text)
+        except ValueError:
+            return None
+
+    try:
+        payload = json.loads(text) if text else {}
+    except ValueError:
+        payload = {}
+    err = payload.get("error") if isinstance(payload, dict) else None
+    reason = ""
+    message = ""
+    if isinstance(err, dict):
+        reason = str(err.get("reason") or "")
+        message = str(err.get("message") or "")
+    elif isinstance(err, str):
+        message = err
+
+    if status == 401 and not _retried:
+        access_token(auth, force_refresh=True)
+        return api(method, path, params, body, auth, _retried=True)
+    if status == 401:
+        raise ApiError("reauth", message or "Spotify rejected the session — connect again", status)
+    if status == 403:
+        if reason == "PREMIUM_REQUIRED" or "premium" in message.lower():
+            raise ApiError("premium_required", "Spotify Premium is required for playback control", status)
+        raise ApiError("forbidden", message or "Spotify refused the request", status)
+    if status == 404:
+        if reason == "NO_ACTIVE_DEVICE" or "device" in message.lower():
+            raise ApiError("no_device", "No active Spotify device", status)
+        raise ApiError("not_found", message or "Not found", status)
+    if status == 429:
+        try:
+            retry_after = int(resp_headers.get("Retry-After") or resp_headers.get("retry-after") or 0)
+        except ValueError:
+            retry_after = 0
+        raise ApiError("rate_limited", "Spotify rate limit hit — retry in %ds" % max(retry_after, 1), status, retry_after)
+    if status >= 500:
+        raise ApiError("server", message or ("Spotify server error (HTTP %d)" % status), status)
+    raise ApiError("http_%d" % status, message or ("Spotify request failed (HTTP %d)" % status), status)
+
+
+def paged(path, params, limit_total, item_key="items"):
+    """Walk a paginated collection endpoint until `limit_total` items or the end."""
+    items = []
+    offset = 0
+    page = int(params.get("limit", 50))
+    total = None
+    while len(items) < limit_total:
+        query = dict(params)
+        query["offset"] = offset
+        payload = api("GET", path, query) or {}
+        batch = payload.get(item_key) or []
+        items.extend(batch)
+        total = payload.get("total")
+        if not batch or len(batch) < page or not payload.get("next"):
+            break
+        offset += len(batch)
+    return items, total
+
+
+# ----------------------------------------------------------------- artwork
+
+def art_url(images, prefer):
+    """Pick the smallest image at least `prefer` px wide, else the largest."""
+    if not isinstance(images, list) or not images:
+        return ""
+    sized = [i for i in images if isinstance(i, dict) and i.get("url")]
+    if not sized:
+        return ""
+    candidates = sorted(sized, key=lambda i: int(i.get("width") or i.get("height") or 0))
+    for image in candidates:
+        if int(image.get("width") or image.get("height") or 0) >= prefer:
+            return image["url"]
+    return candidates[-1]["url"]
+
+
+def art_path_for(url):
+    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:28]
+    return os.path.join(CACHE_DIR, digest + ".jpg")
+
+
+def cache_one(url):
+    path = art_path_for(url)
+    if os.path.exists(path):
+        return path
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=ART_TIMEOUT) as resp:
+            blob = resp.read()
+        tmp = path + ".%d.tmp" % os.getpid()
+        with open(tmp, "wb") as fh:
+            fh.write(blob)
+        os.replace(tmp, path)
+        return path
+    except Exception:
+        return ""
+
+
+def cache_art(items):
+    """Fill `artPath` on every dict in `items` (recursing one level into `items`
+    lists) by downloading their `art` URLs concurrently."""
+    targets = []
+
+    def collect(obj):
+        if isinstance(obj, dict):
+            if obj.get("art") and not obj.get("artPath"):
+                targets.append(obj)
+            for value in obj.values():
+                if isinstance(value, (list, dict)):
+                    collect(value)
+        elif isinstance(obj, list):
+            for value in obj:
+                collect(value)
+
+    collect(items)
+    if not targets:
+        return items
+    urls = sorted({t["art"] for t in targets})
+    with ThreadPoolExecutor(max_workers=ART_WORKERS) as pool:
+        paths = dict(zip(urls, pool.map(cache_one, urls)))
+    for target in targets:
+        target["artPath"] = paths.get(target["art"], "")
+    return items
+
+
+# -------------------------------------------------------------- normalizers
+
+def names(entries):
+    if not isinstance(entries, list):
+        return ""
+    return ", ".join(str(e.get("name", "")) for e in entries if isinstance(e, dict) and e.get("name"))
+
+
+def short(text, limit=220):
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def resume(obj):
+    point = obj.get("resume_point") if isinstance(obj, dict) else None
+    if not isinstance(point, dict):
+        return 0, False
+    return int(point.get("resume_position_ms") or 0), bool(point.get("fully_played"))
+
+
+def norm_track(t, art_size=64):
+    if not isinstance(t, dict):
+        return None
+    album = t.get("album") if isinstance(t.get("album"), dict) else {}
+    return {
+        "type": "track",
+        "id": t.get("id", ""),
+        "uri": t.get("uri", ""),
+        "name": t.get("name", ""),
+        "artists": names(t.get("artists")),
+        "album": album.get("name", ""),
+        "albumUri": album.get("uri", ""),
+        "durationMs": int(t.get("duration_ms") or 0),
+        "explicit": bool(t.get("explicit")),
+        "art": art_url(album.get("images"), art_size),
+        "playable": t.get("is_playable", True) is not False,
+    }
+
+
+def norm_episode(e, art_size=64, parent=None):
+    if not isinstance(e, dict):
+        return None
+    show = e.get("show") if isinstance(e.get("show"), dict) else (parent or {})
+    resume_ms, played = resume(e)
+    return {
+        "type": "episode",
+        "id": e.get("id", ""),
+        "uri": e.get("uri", ""),
+        "name": e.get("name", ""),
+        "show": show.get("name", ""),
+        "showUri": show.get("uri", ""),
+        "durationMs": int(e.get("duration_ms") or 0),
+        "releaseDate": e.get("release_date", ""),
+        "description": short(e.get("description")),
+        "resumeMs": resume_ms,
+        "fullyPlayed": played,
+        "art": art_url(e.get("images"), art_size) or art_url(show.get("images"), art_size),
+    }
+
+
+def norm_chapter(c, art_size=64, parent=None):
+    if not isinstance(c, dict):
+        return None
+    book = c.get("audiobook") if isinstance(c.get("audiobook"), dict) else (parent or {})
+    resume_ms, played = resume(c)
+    return {
+        "type": "chapter",
+        "id": c.get("id", ""),
+        "uri": c.get("uri", ""),
+        "name": c.get("name", ""),
+        "chapterNumber": int(c.get("chapter_number") or 0),
+        "book": book.get("name", ""),
+        "bookUri": book.get("uri", ""),
+        "durationMs": int(c.get("duration_ms") or 0),
+        "resumeMs": resume_ms,
+        "fullyPlayed": played,
+        "art": art_url(c.get("images"), art_size) or art_url(book.get("images"), art_size),
+    }
+
+
+def norm_playlist(p, art_size=64):
+    if not isinstance(p, dict):
+        return None
+    owner = p.get("owner") if isinstance(p.get("owner"), dict) else {}
+    counter = p.get("items") if isinstance(p.get("items"), dict) else (p.get("tracks") if isinstance(p.get("tracks"), dict) else {})
+    return {
+        "type": "playlist",
+        "id": p.get("id", ""),
+        "uri": p.get("uri", ""),
+        "name": p.get("name", ""),
+        "owner": owner.get("display_name") or owner.get("id", ""),
+        "ownerId": owner.get("id", ""),
+        "count": int(counter.get("total") or 0),
+        "description": short(p.get("description")),
+        "collaborative": bool(p.get("collaborative")),
+        "art": art_url(p.get("images"), art_size),
+    }
+
+
+def norm_album(a, art_size=64):
+    if not isinstance(a, dict):
+        return None
+    return {
+        "type": "album",
+        "id": a.get("id", ""),
+        "uri": a.get("uri", ""),
+        "name": a.get("name", ""),
+        "artists": names(a.get("artists")),
+        "year": str(a.get("release_date", ""))[:4],
+        "totalTracks": int(a.get("total_tracks") or 0),
+        "albumType": a.get("album_type", ""),
+        "art": art_url(a.get("images"), art_size),
+    }
+
+
+def norm_artist(a, art_size=64):
+    if not isinstance(a, dict):
+        return None
+    return {
+        "type": "artist",
+        "id": a.get("id", ""),
+        "uri": a.get("uri", ""),
+        "name": a.get("name", ""),
+        "genres": ", ".join((a.get("genres") or [])[:2]),
+        "art": art_url(a.get("images"), art_size),
+    }
+
+
+def norm_show(s, art_size=64):
+    if not isinstance(s, dict):
+        return None
+    return {
+        "type": "show",
+        "id": s.get("id", ""),
+        "uri": s.get("uri", ""),
+        "name": s.get("name", ""),
+        "publisher": s.get("publisher", ""),
+        "totalEpisodes": int(s.get("total_episodes") or 0),
+        "description": short(s.get("description")),
+        "art": art_url(s.get("images"), art_size),
+    }
+
+
+def norm_audiobook(b, art_size=64):
+    if not isinstance(b, dict):
+        return None
+    return {
+        "type": "audiobook",
+        "id": b.get("id", ""),
+        "uri": b.get("uri", ""),
+        "name": b.get("name", ""),
+        "authors": names(b.get("authors")),
+        "narrators": names(b.get("narrators")),
+        "totalChapters": int(b.get("total_chapters") or 0),
+        "description": short(b.get("description")),
+        "art": art_url(b.get("images"), art_size),
+    }
+
+
+def norm_any(obj, art_size=64):
+    kind = obj.get("type") if isinstance(obj, dict) else ""
+    if kind == "track":
+        return norm_track(obj, art_size)
+    if kind == "episode":
+        return norm_episode(obj, art_size)
+    if kind == "chapter":
+        return norm_chapter(obj, art_size)
+    if kind == "album":
+        return norm_album(obj, art_size)
+    if kind == "artist":
+        return norm_artist(obj, art_size)
+    if kind == "playlist":
+        return norm_playlist(obj, art_size)
+    if kind == "show":
+        return norm_show(obj, art_size)
+    if kind == "audiobook":
+        return norm_audiobook(obj, art_size)
+    return None
+
+
+def norm_device(d):
+    if not isinstance(d, dict):
+        return None
+    return {
+        "id": d.get("id", ""),
+        "name": d.get("name", ""),
+        "kind": d.get("type", ""),
+        "isActive": bool(d.get("is_active")),
+        "isRestricted": bool(d.get("is_restricted")),
+        "volume": int(d.get("volume_percent") or 0) if d.get("volume_percent") is not None else -1,
+        "supportsVolume": bool(d.get("supports_volume", True)),
+    }
+
+
+# -------------------------------------------------------------- subcommands
+
+def app_state():
+    binary = shutil.which("spotify") or shutil.which("spotify-launcher") or ""
+    running = False
+    if binary:
+        try:
+            running = subprocess.run(["pgrep", "-x", "spotify"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3).returncode == 0
+        except Exception:
+            running = False
+    return binary, running
+
+
+def cmd_status(args):
+    auth = load_auth()
+    binary, running = app_state()
+    data = {
+        "configured": bool(auth.get("client_id")),
+        "clientId": auth.get("client_id", ""),
+        "clientIdMasked": mask(auth.get("client_id", "")),
+        "authenticated": bool(auth.get("refresh_token")) and not auth.get("needs_reauth"),
+        "needsReauth": bool(auth.get("needs_reauth")),
+        "user": auth.get("user") or {},
+        "authorizedAt": auth.get("authorized_at", 0),
+        "appBinary": binary,
+        "appInstalled": bool(binary),
+        "appRunning": running,
+        "lastPlayed": load_last(),
+    }
+    out(data)
+
+
+class CallbackHandler(BaseHTTPRequestHandler):
+    result = {}
+    expected_state = ""
+
+    def log_message(self, fmt, *args):  # silence the default stderr chatter
+        pass
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != "/callback":
+            self.send_response(404)
+            self.end_headers()
+            return
+        query = urllib.parse.parse_qs(parsed.query)
+        state = (query.get("state") or [""])[0]
+        if state != CallbackHandler.expected_state:
+            CallbackHandler.result = {"error": "state_mismatch"}
+            body = "Login response did not match this request. Try connecting again."
+        elif query.get("error"):
+            CallbackHandler.result = {"error": query["error"][0]}
+            body = "Spotify reported: %s. You can close this tab." % query["error"][0]
+        else:
+            CallbackHandler.result = {"code": (query.get("code") or [""])[0]}
+            body = "Connected to Spotify. You can close this tab and go back to your bar."
+        page = ("<!doctype html><meta charset=utf-8><title>Omarchy Spotify</title>"
+                "<body style=\"font-family:monospace;background:#101315;color:#cacccc;display:flex;"
+                "align-items:center;justify-content:center;height:100vh;margin:0\">"
+                "<div style=\"text-align:center\"><div style=\"font-size:48px\">&#9835;</div>"
+                "<p>%s</p></div></body>" % body).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(page)))
+        self.end_headers()
+        self.wfile.write(page)
+
+
+def cmd_auth(args):
+    client_id = (args.client_id or load_auth().get("client_id") or "").strip()
+    if not client_id:
+        return fail("no_client_id", "A Spotify app Client ID is required")
+    port = int(args.port)
+    redirect_uri = "http://127.0.0.1:%d/callback" % port
+
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).decode("ascii").rstrip("=")
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).decode("ascii").rstrip("=")
+    state = secrets.token_urlsafe(16)
+    CallbackHandler.expected_state = state
+    CallbackHandler.result = {}
+
+    try:
+        server = HTTPServer(("127.0.0.1", port), CallbackHandler)
+    except OSError as err:
+        return fail("port_busy", "Port %d is busy (%s) — pick another redirect port" % (port, err))
+    server.timeout = 1
+
+    authorize_url = ACCOUNTS + "/authorize?" + urllib.parse.urlencode({
+        "client_id": client_id,
+        "response_type": "code",
+        "redirect_uri": redirect_uri,
+        "code_challenge_method": "S256",
+        "code_challenge": challenge,
+        "state": state,
+        "scope": " ".join(SCOPES),
+    })
+
+    if args.print_url:
+        sys.stderr.write(authorize_url + "\n")
+    if not args.no_browser:
+        opener = shutil.which("xdg-open") or shutil.which("omarchy-launch-browser")
+        if opener:
+            try:
+                subprocess.Popen([opener, authorize_url], start_new_session=True,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError:
+                pass
+
+    deadline = time.time() + int(args.timeout)
+    try:
+        while time.time() < deadline and not CallbackHandler.result:
+            server.handle_request()
+    finally:
+        server.server_close()
+
+    result = CallbackHandler.result
+    if not result:
+        return fail("timeout", "Timed out waiting for Spotify to redirect back", {"authorizeUrl": authorize_url})
+    if result.get("error"):
+        return fail("denied", "Spotify login failed: %s" % result["error"])
+
+    payload = token_request({
+        "grant_type": "authorization_code",
+        "code": result["code"],
+        "redirect_uri": redirect_uri,
+        "client_id": client_id,
+        "code_verifier": verifier,
+    })
+    auth = {"client_id": client_id, "redirect_port": port, "authorized_at": time.time()}
+    store_tokens(auth, payload)
+    try:
+        me = api("GET", "/me", auth=auth) or {}
+        auth["user"] = {"id": me.get("id", ""), "name": me.get("display_name") or me.get("id", ""),
+                        "art": art_url(me.get("images"), 64)}
+        save_auth(auth)
+    except ApiError:
+        pass
+    out({"authenticated": True, "user": auth.get("user") or {}})
+
+
+def cmd_logout(args):
+    clear_auth()
+    out({"authenticated": False})
+
+
+def cmd_me(args):
+    me = api("GET", "/me") or {}
+    out({"id": me.get("id", ""), "name": me.get("display_name") or me.get("id", ""), "art": art_url(me.get("images"), 64)})
+
+
+def cmd_player(args):
+    state = api("GET", "/me/player", {"additional_types": "track,episode"})
+    if not state:
+        out({"active": False, "fetchedAt": int(time.time() * 1000)})
+        return
+    item = norm_any(state.get("item") or {}, 300)
+    if item:
+        cache_art([item])
+        remember_last(item)
+    device = norm_device(state.get("device")) or {}
+    context = state.get("context") if isinstance(state.get("context"), dict) else {}
+    data = {
+        "active": True,
+        "fetchedAt": int(time.time() * 1000),
+        "isPlaying": bool(state.get("is_playing")),
+        "progressMs": int(state.get("progress_ms") or 0),
+        "shuffle": bool(state.get("shuffle_state")),
+        "repeat": state.get("repeat_state") or "off",
+        "device": device,
+        "volume": device.get("volume", -1),
+        "context": {"uri": context.get("uri", ""), "type": context.get("type", "")},
+        "item": item,
+        "actions": (state.get("actions") or {}).get("disallows") or {},
+    }
+    out(data)
+
+
+def cmd_devices(args):
+    payload = api("GET", "/me/player/devices") or {}
+    devices = [d for d in (norm_device(x) for x in payload.get("devices") or []) if d]
+    out(devices)
+
+
+def first_device_id():
+    payload = api("GET", "/me/player/devices") or {}
+    devices = [d for d in (norm_device(x) for x in payload.get("devices") or []) if d and d.get("id")]
+    if not devices:
+        return ""
+    for d in devices:
+        if d["isActive"]:
+            return d["id"]
+    return devices[0]["id"]
+
+
+def with_device_fallback(fn, device_id=""):
+    """Run a player action; on NO_ACTIVE_DEVICE, retry against the first
+    device Spotify Connect knows about (typically the local desktop app)."""
+    try:
+        return fn(device_id)
+    except ApiError as err:
+        if err.code != "no_device" or device_id:
+            raise
+        fallback = first_device_id()
+        if not fallback:
+            raise
+        return fn(fallback)
+
+
+def cmd_play(args):
+    body = {}
+    if args.context:
+        body["context_uri"] = args.context
+    if args.uris:
+        body["uris"] = list(args.uris)
+    if args.offset_uri:
+        body["offset"] = {"uri": args.offset_uri}
+    elif args.offset_position is not None:
+        body["offset"] = {"position": int(args.offset_position)}
+    if args.position_ms is not None:
+        body["position_ms"] = int(args.position_ms)
+
+    def go(device_id):
+        params = {"device_id": device_id} if device_id else None
+        try:
+            api("PUT", "/me/player/play", params, body if body else None)
+        except ApiError as err:
+            # Some contexts (audiobooks, occasionally shows) refuse a context
+            # play; fall back to playing the chosen item directly.
+            if body.get("context_uri") and args.offset_uri and err.code.startswith("http_4"):
+                api("PUT", "/me/player/play", params, {"uris": [args.offset_uri]})
+            else:
+                raise
+        return {"played": True}
+
+    out(with_device_fallback(go, args.device or ""))
+
+
+def cmd_pause(args):
+    api("PUT", "/me/player/pause")
+    out({"paused": True})
+
+
+def cmd_next(args):
+    api("POST", "/me/player/next")
+    out({"skipped": True})
+
+
+def cmd_previous(args):
+    api("POST", "/me/player/previous")
+    out({"skipped": True})
+
+
+def cmd_seek(args):
+    api("PUT", "/me/player/seek", {"position_ms": max(0, int(args.position_ms))})
+    out({"positionMs": int(args.position_ms)})
+
+
+def cmd_volume(args):
+    pct = max(0, min(100, int(args.percent)))
+    api("PUT", "/me/player/volume", {"volume_percent": pct})
+    out({"volume": pct})
+
+
+def cmd_shuffle(args):
+    state = args.state.lower() in ("on", "true", "1")
+    api("PUT", "/me/player/shuffle", {"state": "true" if state else "false"})
+    out({"shuffle": state})
+
+
+def cmd_repeat(args):
+    mode = args.mode.lower()
+    if mode not in ("off", "context", "track"):
+        return fail("bad_args", "repeat mode must be off, context, or track")
+    api("PUT", "/me/player/repeat", {"state": mode})
+    out({"repeat": mode})
+
+
+def cmd_transfer(args):
+    api("PUT", "/me/player", None, {"device_ids": [args.device_id], "play": bool(args.play)})
+    out({"device": args.device_id})
+
+
+def cmd_queue_add(args):
+    def go(device_id):
+        params = {"uri": args.uri}
+        if device_id:
+            params["device_id"] = device_id
+        api("POST", "/me/player/queue", params)
+        return {"queued": args.uri}
+    out(with_device_fallback(go))
+
+
+def cmd_queue(args):
+    payload = api("GET", "/me/player/queue") or {}
+    items = [n for n in (norm_any(x) for x in payload.get("queue") or []) if n]
+    out(cache_art(items[:20]))
+
+
+def cmd_recent(args):
+    payload = api("GET", "/me/player/recently-played", {"limit": 50}) or {}
+    seen = set()
+    items = []
+    for entry in payload.get("items") or []:
+        track = norm_track(entry.get("track")) if isinstance(entry, dict) else None
+        if not track or not track["uri"] or track["uri"] in seen:
+            continue
+        seen.add(track["uri"])
+        ctx = entry.get("context") if isinstance(entry.get("context"), dict) else {}
+        track["contextUri"] = ctx.get("uri", "")
+        track["contextType"] = ctx.get("type", "")
+        items.append(track)
+        if len(items) >= int(args.limit):
+            break
+    out(cache_art(items))
+
+
+def cmd_playlists(args):
+    raw, _ = paged("/me/playlists", {"limit": 50}, int(args.limit))
+    items = [n for n in (norm_playlist(p) for p in raw) if n]
+    liked_total = 0
+    try:
+        liked = api("GET", "/me/tracks", {"limit": 1}) or {}
+        liked_total = int(liked.get("total") or 0)
+    except ApiError:
+        liked_total = 0
+    out({"items": cache_art(items), "likedCount": liked_total})
+
+
+def cmd_playlist_items(args):
+    raw, total = paged("/playlists/%s/items" % args.id, {"limit": 100, "additional_types": "track,episode"}, int(args.limit))
+    items = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        payload = entry.get("item") or entry.get("track")
+        norm = norm_any(payload or {})
+        if norm and norm.get("uri"):
+            items.append(norm)
+    out({"items": cache_art(items), "total": int(total or len(items))})
+
+
+def cmd_liked(args):
+    raw, total = paged("/me/tracks", {"limit": 50}, int(args.limit))
+    items = [n for n in (norm_track(e.get("track") if isinstance(e, dict) else None) for e in raw) if n and n.get("uri")]
+    out({"items": cache_art(items), "total": int(total or len(items))})
+
+
+def cmd_audiobooks(args):
+    raw, _ = paged("/me/audiobooks", {"limit": 50}, int(args.limit))
+    items = []
+    for entry in raw:
+        payload = entry.get("audiobook") if isinstance(entry, dict) and isinstance(entry.get("audiobook"), dict) else entry
+        norm = norm_audiobook(payload)
+        if norm and norm.get("uri"):
+            items.append(norm)
+    out(cache_art(items))
+
+
+def cmd_audiobook_chapters(args):
+    book = api("GET", "/audiobooks/%s" % args.id) or {}
+    raw, total = paged("/audiobooks/%s/chapters" % args.id, {"limit": 50}, int(args.limit))
+    parent = {"name": book.get("name", ""), "uri": book.get("uri", ""), "images": book.get("images")}
+    items = [n for n in (norm_chapter(c, 64, parent) for c in raw) if n and n.get("uri")]
+    out({"items": items, "total": int(total or len(items)), "book": cache_art([norm_audiobook(book, 300) or {}])[0]})
+
+
+def cmd_shows(args):
+    raw, _ = paged("/me/shows", {"limit": 50}, int(args.limit))
+    items = []
+    for entry in raw:
+        payload = entry.get("show") if isinstance(entry, dict) and isinstance(entry.get("show"), dict) else entry
+        norm = norm_show(payload)
+        if norm and norm.get("uri"):
+            items.append(norm)
+    out(cache_art(items))
+
+
+def cmd_show_episodes(args):
+    show = api("GET", "/shows/%s" % args.id) or {}
+    raw, total = paged("/shows/%s/episodes" % args.id, {"limit": 50}, int(args.limit))
+    parent = {"name": show.get("name", ""), "uri": show.get("uri", ""), "images": show.get("images")}
+    items = [n for n in (norm_episode(e, 64, parent) for e in raw) if n and n.get("uri")]
+    out({"items": cache_art(items), "total": int(total or len(items)), "show": cache_art([norm_show(show, 300) or {}])[0]})
+
+
+def cmd_album_tracks(args):
+    album = api("GET", "/albums/%s" % args.id) or {}
+    raw, total = paged("/albums/%s/tracks" % args.id, {"limit": 50}, int(args.limit))
+    art = art_url(album.get("images"), 64)
+    items = []
+    for t in raw:
+        norm = norm_track(t)
+        if norm and norm.get("uri"):
+            norm["album"] = album.get("name", "")
+            norm["art"] = art
+            items.append(norm)
+    out({"items": cache_art(items), "total": int(total or len(items)), "album": cache_art([norm_album(album, 300) or {}])[0]})
+
+
+SEARCH_TYPES = ["track", "artist", "album", "playlist", "show", "episode", "audiobook"]
+
+
+def cmd_search(args):
+    query = (args.query or "").strip()
+    if not query:
+        out({"query": "", "groups": []})
+        return
+    types = [t for t in (args.types or "").split(",") if t in SEARCH_TYPES] or SEARCH_TYPES
+    limit = max(1, min(10, int(args.limit)))
+    payload = api("GET", "/search", {"q": query, "type": ",".join(types), "limit": limit}) or {}
+    plural = {"track": "tracks", "artist": "artists", "album": "albums", "playlist": "playlists",
+              "show": "shows", "episode": "episodes", "audiobook": "audiobooks"}
+    groups = []
+    for kind in types:
+        bucket = payload.get(plural[kind]) or {}
+        items = [n for n in (norm_any(x) for x in bucket.get("items") or []) if n and n.get("uri")]
+        if items:
+            groups.append({"type": kind, "items": items})
+    cache_art(groups)
+    out({"query": query, "groups": groups})
+
+
+def cmd_library_contains(args):
+    payload = api("GET", "/me/library/contains", {"uris": ",".join(args.uris)})
+    flags = payload if isinstance(payload, list) else []
+    out({uri: bool(flag) for uri, flag in zip(args.uris, flags)})
+
+
+def cmd_library_save(args):
+    api("PUT", "/me/library", None, {"uris": list(args.uris)})
+    out({"saved": list(args.uris)})
+
+
+def cmd_library_remove(args):
+    api("DELETE", "/me/library", None, {"uris": list(args.uris)})
+    out({"removed": list(args.uris)})
+
+
+# --------------------------------------------------------------------- main
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="spotify-bridge", description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("status").set_defaults(fn=cmd_status)
+    p = sub.add_parser("auth")
+    p.add_argument("--client-id", default="")
+    p.add_argument("--port", type=int, default=8888)
+    p.add_argument("--timeout", type=int, default=300)
+    p.add_argument("--no-browser", action="store_true")
+    p.add_argument("--print-url", action="store_true")
+    p.set_defaults(fn=cmd_auth)
+    sub.add_parser("logout").set_defaults(fn=cmd_logout)
+    sub.add_parser("me").set_defaults(fn=cmd_me)
+
+    sub.add_parser("player").set_defaults(fn=cmd_player)
+    sub.add_parser("devices").set_defaults(fn=cmd_devices)
+    p = sub.add_parser("play")
+    p.add_argument("--context", default="")
+    p.add_argument("--uris", nargs="*", default=[])
+    p.add_argument("--offset-uri", default="")
+    p.add_argument("--offset-position", type=int, default=None)
+    p.add_argument("--position-ms", type=int, default=None)
+    p.add_argument("--device", default="")
+    p.set_defaults(fn=cmd_play)
+    sub.add_parser("pause").set_defaults(fn=cmd_pause)
+    sub.add_parser("next").set_defaults(fn=cmd_next)
+    sub.add_parser("previous").set_defaults(fn=cmd_previous)
+    p = sub.add_parser("seek"); p.add_argument("position_ms", type=int); p.set_defaults(fn=cmd_seek)
+    p = sub.add_parser("volume"); p.add_argument("percent", type=int); p.set_defaults(fn=cmd_volume)
+    p = sub.add_parser("shuffle"); p.add_argument("state"); p.set_defaults(fn=cmd_shuffle)
+    p = sub.add_parser("repeat"); p.add_argument("mode"); p.set_defaults(fn=cmd_repeat)
+    p = sub.add_parser("transfer"); p.add_argument("device_id"); p.add_argument("--play", action="store_true"); p.set_defaults(fn=cmd_transfer)
+    p = sub.add_parser("queue-add"); p.add_argument("uri"); p.set_defaults(fn=cmd_queue_add)
+    sub.add_parser("queue").set_defaults(fn=cmd_queue)
+    p = sub.add_parser("recent"); p.add_argument("--limit", type=int, default=12); p.set_defaults(fn=cmd_recent)
+
+    p = sub.add_parser("playlists"); p.add_argument("--limit", type=int, default=500); p.set_defaults(fn=cmd_playlists)
+    p = sub.add_parser("playlist-items"); p.add_argument("id"); p.add_argument("--limit", type=int, default=300); p.set_defaults(fn=cmd_playlist_items)
+    p = sub.add_parser("liked"); p.add_argument("--limit", type=int, default=100); p.set_defaults(fn=cmd_liked)
+    p = sub.add_parser("audiobooks"); p.add_argument("--limit", type=int, default=200); p.set_defaults(fn=cmd_audiobooks)
+    p = sub.add_parser("audiobook-chapters"); p.add_argument("id"); p.add_argument("--limit", type=int, default=300); p.set_defaults(fn=cmd_audiobook_chapters)
+    p = sub.add_parser("shows"); p.add_argument("--limit", type=int, default=200); p.set_defaults(fn=cmd_shows)
+    p = sub.add_parser("show-episodes"); p.add_argument("id"); p.add_argument("--limit", type=int, default=100); p.set_defaults(fn=cmd_show_episodes)
+    p = sub.add_parser("album-tracks"); p.add_argument("id"); p.add_argument("--limit", type=int, default=100); p.set_defaults(fn=cmd_album_tracks)
+    p = sub.add_parser("search"); p.add_argument("query"); p.add_argument("--types", default=""); p.add_argument("--limit", type=int, default=6); p.set_defaults(fn=cmd_search)
+
+    p = sub.add_parser("library-contains"); p.add_argument("uris", nargs="+"); p.set_defaults(fn=cmd_library_contains)
+    p = sub.add_parser("library-save"); p.add_argument("uris", nargs="+"); p.set_defaults(fn=cmd_library_save)
+    p = sub.add_parser("library-remove"); p.add_argument("uris", nargs="+"); p.set_defaults(fn=cmd_library_remove)
+    return parser
+
+
+def main(argv):
+    args = build_parser().parse_args(argv)
+    try:
+        args.fn(args)
+        return 0
+    except ApiError as err:
+        fail(err.code, err.message, {"status": err.status, "retryAfter": err.retry_after})
+        return 0
+    except KeyboardInterrupt:
+        fail("cancelled", "Cancelled")
+        return 0
+    except Exception as err:  # noqa: BLE001 — surfaced to the panel as text
+        fail("internal", "%s: %s" % (type(err).__name__, err))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
