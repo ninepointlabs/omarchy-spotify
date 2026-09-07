@@ -1,0 +1,27 @@
+[Unit]
+Description=Spotify Soloist — headless Spotify Connect device
+Documentation=https://developer.spotify.com/documentation/soloist
+After=pipewire.service pipewire-pulse.service wireplumber.service network-online.target
+Wants=pipewire.service pipewire-pulse.service network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/soloist/soloist.env
+# Refuse to start until the API key has been filled in.
+ExecStartPre=/bin/sh -c 'test -n "$SOLOIST_API_KEY" || { echo "SOLOIST_API_KEY is empty in ~/.config/soloist/soloist.env" >&2; exit 1; }'
+ExecStart=%h/.local/bin/soloist \
+  --device-name "${SOLOIST_DEVICE_NAME}" \
+  --api-key "${SOLOIST_API_KEY}" \
+  --data-dir %h/.local/share/soloist \
+  --cache-dir %h/.cache/soloist \
+  --cache-size 2048 \
+  --initial-volume 60 \
+  --ws 127.0.0.1:0
+Restart=on-failure
+RestartSec=5
+# Exit code 10 means the build expired (90-day limit); restarting won't help,
+# the weekly soloist-update.timer replaces the binary.
+RestartPreventExitStatus=10
+
+[Install]
+WantedBy=default.target

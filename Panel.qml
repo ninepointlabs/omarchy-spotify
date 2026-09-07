@@ -91,7 +91,10 @@ Panel {
     if (!authenticated) return ""
     if (service.premiumRequired) return "Spotify Premium is required for playback control"
     if (playerActive && service.deviceName !== "") return (isPlaying ? "Playing on " : "Paused on ") + service.deviceName
-    if (service.daemonInstalled && !service.daemonRunning) return "spotifyd isn't running — start it to play here"
+    if (service.daemonExpired) return "Soloist build expired — run soloist-update"
+    if (service.daemonInstalled && !service.daemonConfigured) return "Soloist needs its API key in ~/.config/soloist/soloist.env"
+    if (service.daemonInstalled && !service.daemonRunning) return "Soloist isn't running — start it to play here"
+    if (service.daemonRunning && !service.daemonPaired) return "Pick “Omarchy” once in the Spotify app to pair Soloist"
     if (service.noDevice) return "No active device — pick one or start a player"
     if (service.user && service.user.name) return "Connected as " + service.user.name
     return "Connected"
@@ -634,7 +637,7 @@ Panel {
 
               Text {
                 width: parent.width
-                text: "This panel needs a player to drive: the Spotify desktop app, or the headless spotifyd daemon (omarchy pkg add spotifyd). Neither is installed yet."
+                text: "This panel needs a player to drive: the Spotify desktop app, or the headless Spotify Soloist daemon (see the README). Neither is installed yet."
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
@@ -908,8 +911,8 @@ Panel {
               spacing: Style.space(8)
 
               Button {
-                visible: root.service && root.service.daemonInstalled && !root.service.daemonRunning
-                text: "Start spotifyd"
+                visible: root.service && root.service.daemonInstalled && root.service.daemonConfigured && !root.service.daemonRunning
+                text: "Start Soloist"
                 iconText: Model.glyph.play
                 bordered: true
                 foreground: root.foreground
@@ -1023,8 +1026,8 @@ Panel {
               topPadding: Style.space(2)
 
               Button {
-                visible: root.service && root.service.daemonInstalled
-                text: root.service && root.service.daemonRunning ? "Restart spotifyd" : "Start spotifyd"
+                visible: root.service && root.service.daemonInstalled && root.service.daemonConfigured
+                text: root.service && root.service.daemonRunning ? "Restart Soloist" : "Start Soloist"
                 iconText: Model.glyph.play
                 foreground: root.foreground
                 accent: root.accent

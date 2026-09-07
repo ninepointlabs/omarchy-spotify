@@ -36,10 +36,13 @@ Item {
   property bool needsReauth: false
   property bool appInstalled: false
   property bool appRunning: false
-  // spotifyd: the headless Spotify Connect device, run as a systemd user service.
+  // Spotify Soloist: the headless Spotify Connect device, run as a systemd
+  // user service. Installed/configured/running/expired come from the bridge.
   property bool daemonInstalled: false
+  property bool daemonConfigured: false
   property bool daemonRunning: false
-  property bool daemonAuthenticated: false
+  property bool daemonExpired: false
+  property bool daemonPaired: false
   readonly property bool hasLocalDevice: appInstalled || daemonInstalled
   property string storedClientId: ""
   property var user: ({})
@@ -207,8 +210,10 @@ Item {
       root.appInstalled = d.appInstalled === true
       root.appRunning = d.appRunning === true
       root.daemonInstalled = d.daemonInstalled === true
+      root.daemonConfigured = d.daemonConfigured === true
       root.daemonRunning = d.daemonRunning === true
-      root.daemonAuthenticated = d.daemonAuthenticated === true
+      root.daemonExpired = d.daemonExpired === true
+      root.daemonPaired = d.daemonPaired === true
       root.user = d.user || {}
       root.lastPlayed = d.lastPlayed || {}
       if (root.authenticated) {
@@ -529,7 +534,10 @@ Item {
     call(["daemon", "start"], function(result) {
       if (!result.ok) { root.flash(result.error, true); return }
       root.daemonRunning = result.data.daemonRunning === true
-      root.flash(root.daemonRunning ? "spotifyd started" : "spotifyd did not stay up — see journalctl --user -u spotifyd", !root.daemonRunning)
+      root.daemonExpired = result.data.daemonExpired === true
+      root.daemonPaired = result.data.daemonPaired === true
+      if (root.daemonRunning) root.flash(root.daemonPaired ? "Soloist started" : "Soloist started — pick “Omarchy” once in the Spotify app to pair it", false)
+      else root.flash(root.daemonExpired ? "Soloist build expired — run soloist-update" : "Soloist did not stay up — see journalctl --user -u soloist", true)
       appLaunchTimer.restart()
     })
   }

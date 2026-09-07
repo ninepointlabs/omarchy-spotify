@@ -1,0 +1,34 @@
+#!/bin/bash
+# Fetch the latest Spotify Soloist build for this machine and swap it in if it
+# changed. Builds expire 90 days after they are made, so this runs weekly from
+# soloist-update.timer; it is also safe to run by hand.
+
+set -euo pipefail
+
+bin="$HOME/.local/bin/soloist"
+case "$(uname -m)" in
+  x86_64) arch=x86_64 ;;
+  aarch64) arch=arm64 ;;
+  armv7l) arch=arm32 ;;
+  *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+curl --fail --silent --location --retry 3 \
+  -o "$tmp/soloist.tar.gz" "https://soloist-builds.spotifycdn.com/soloist_release_${arch}.tar.gz"
+tar -xzf "$tmp/soloist.tar.gz" -C "$tmp" soloist
+
+if [[ -x "$bin" ]] && cmp -s "$tmp/soloist" "$bin"; then
+  echo "soloist is current: $("$bin" --version)"
+  exit 0
+fi
+
+install -m 755 "$tmp/soloist" "$bin"
+echo "installed $("$bin" --version)"
+
+if systemctl --user is-enabled --quiet soloist 2>/dev/null; then
+  systemctl --user restart soloist
+  echo "restarted soloist.service"
+fi

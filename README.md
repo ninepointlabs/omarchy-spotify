@@ -73,30 +73,51 @@ the matching redirect URI in the Spotify dashboard.
 ## Playing without the Spotify app open
 
 The Web API only steers a Spotify Connect device; it never plays audio
-itself. [spotifyd](https://spotifyd.rs) is a headless Connect device that
-runs as a systemd user service, so the panel works with no window anywhere:
+itself. [Spotify Soloist](https://developer.spotify.com/documentation/soloist)
+is Spotify's own headless Connect client for Linux (announced August 2026).
+Run it as a systemd user service and the panel works with no window anywhere.
+
+> Why not spotifyd / librespot? Since late 2025 Spotify refuses audio
+> decryption keys to librespot-based players for accounts created after
+> roughly 2024, so they connect fine but skip every track in silence
+> ([librespot#1649](https://github.com/librespot-org/librespot/issues/1649)).
+> Soloist uses Spotify's real playback engine and does not have that problem.
+
+1. Generate an API key: <https://developer.spotify.com/dashboard> →
+   **Spotify Soloist API Key** → accept the terms → Generate. It is tied to
+   your (Premium) account; don't share it.
+2. Install the binary, service and weekly updater (Soloist builds expire 90
+   days after they are made, exit code 10):
 
 ```sh
-omarchy pkg add spotifyd                   # Arch extra repo
-mkdir -p ~/.config/spotifyd
-cat > ~/.config/spotifyd/spotifyd.conf <<'EOF'
-[global]
-device_name = "My Omarchy box"
-device_type = "computer"
-backend = "pulseaudio"                    # PipeWire's Pulse server
-bitrate = 320
-cache_path = "/home/YOU/.cache/spotifyd"  # absolute; the login lives here
-use_mpris = true
-dbus_type = "session"
+curl -fsSL -o /tmp/soloist.tar.gz https://soloist-builds.spotifycdn.com/soloist_release_x86_64.tar.gz
+tar -xzf /tmp/soloist.tar.gz -C /tmp soloist && install -m 755 /tmp/soloist ~/.local/bin/soloist
+mkdir -p ~/.config/soloist
+cat > ~/.config/soloist/soloist.env <<'EOF'
+SOLOIST_API_KEY=paste-your-key-here
+SOLOIST_DEVICE_NAME=Omarchy
 EOF
-spotifyd authenticate                      # one-time browser login
-systemctl --user enable --now spotifyd
+chmod 600 ~/.config/soloist/soloist.env
 ```
 
-The panel detects it: a **Start spotifyd** button appears whenever the
-service is stopped, and pressing Play with no active device transfers
-playback to it automatically. It also speaks MPRIS, so `playerctl` and the
-stock `omarchy.media` widget see it. Spotify Premium is required.
+   Unit files for `soloist.service`, `soloist-update.service` and
+   `soloist-update.timer` are in [`contrib/systemd/`](contrib/systemd/);
+   copy them to `~/.config/systemd/user/` together with
+   [`contrib/soloist-update`](contrib/soloist-update) in `~/.local/bin/`, then:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now soloist soloist-update.timer
+```
+
+3. Pair once: open the Spotify app (desktop or phone, same network), open
+   the device picker, choose **Omarchy**. Soloist stores the session and
+   restores it on every restart.
+
+From then on the panel lists Omarchy under the device button, shows a
+**Start Soloist** button whenever the service is stopped, and pressing Play
+with no active device transfers playback to it. Soloist also exposes a local
+WebSocket API and a `soloist ctl` command for scripting.
 
 ## Using it
 

@@ -567,23 +567,66 @@ def quiet_ok(argv):
         return False
 
 
+SOLOIST_ENV = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "soloist", "soloist.env")
+SOLOIST_UNIT = "soloist"
+
+
+def systemctl_user(*args):
+    try:
+        done = subprocess.run(["systemctl", "--user"] + list(args), capture_output=True, text=True, timeout=3)
+        return done.returncode, done.stdout.strip()
+    except Exception:
+        return 1, ""
+
+
+def soloist_state():
+    """Spotify Soloist — Spotify's own headless Connect client, run here as a
+    systemd user service. librespot-based daemons (spotifyd, spotify-player)
+    no longer get audio keys for newer accounts, so Soloist is what the panel
+    offers to start."""
+    binary = shutil.which("soloist") or (os.path.join(HOME, ".local", "bin", "soloist")
+                                          if os.path.exists(os.path.join(HOME, ".local", "bin", "soloist")) else "")
+    configured = False
+    if os.path.exists(SOLOIST_ENV):
+        try:
+            with open(SOLOIST_ENV, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line.startswith("SOLOIST_API_KEY=") and line.split("=", 1)[1].strip().strip('"\'') != "":
+                        configured = True
+        except OSError:
+            configured = False
+    running = bool(binary) and systemctl_user("is-active", "--quiet", SOLOIST_UNIT)[0] == 0
+    _, exit_status = systemctl_user("show", "-p", "ExecMainStatus", "--value", SOLOIST_UNIT)
+    expired = bool(binary) and not running and exit_status == "10"
+    data_dir = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share"), "soloist")
+    paired = False
+    try:
+        paired = any(not name.startswith("ws.") for name in os.listdir(data_dir))
+    except OSError:
+        paired = False
+    return {
+        "daemonName": "Soloist",
+        "daemonInstalled": bool(binary),
+        "daemonConfigured": configured,
+        "daemonRunning": running,
+        "daemonExpired": expired,
+        "daemonPaired": paired,
+    }
+
+
 def app_state():
-    """The desktop app and the headless spotifyd daemon are the two local
+    """The desktop app and the headless Soloist daemon are the two local
     Spotify Connect devices the panel knows how to start."""
     binary = shutil.which("spotify") or shutil.which("spotify-launcher") or ""
     running = bool(binary) and quiet_ok(["pgrep", "-x", "spotify"])
-    daemon = shutil.which("spotifyd") or ""
-    daemon_running = bool(daemon) and quiet_ok(["systemctl", "--user", "is-active", "--quiet", "spotifyd"])
-    daemon_authenticated = bool(daemon) and os.path.exists(
-        os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "spotifyd", "oauth", "credentials.json"))
-    return {
+    state = {
         "appBinary": binary,
         "appInstalled": bool(binary),
         "appRunning": running,
-        "daemonInstalled": bool(daemon),
-        "daemonRunning": daemon_running,
-        "daemonAuthenticated": daemon_authenticated,
     }
+    state.update(soloist_state())
+    return state
 
 
 def cmd_status(args):
@@ -603,22 +646,26 @@ def cmd_status(args):
 
 
 def cmd_daemon(args):
-    """Start/stop the spotifyd user service so the panel has a device."""
-    if not shutil.which("spotifyd"):
-        return fail("no_daemon", "spotifyd is not installed (omarchy pkg add spotifyd)")
+    """Start/stop the Soloist user service so the panel has a device."""
+    state = soloist_state()
+    if not state["daemonInstalled"]:
+        return fail("no_daemon", "Spotify Soloist is not installed — see the README")
+    if not state["daemonConfigured"]:
+        return fail("daemon_unconfigured", "Add your Soloist API key to ~/.config/soloist/soloist.env first")
     verb = args.action
     if verb == "start":
-        ok = quiet_ok(["systemctl", "--user", "start", "spotifyd"])
+        ok = quiet_ok(["systemctl", "--user", "start", SOLOIST_UNIT])
         if ok:
-            quiet_ok(["systemctl", "--user", "enable", "--quiet", "spotifyd"])
+            quiet_ok(["systemctl", "--user", "enable", "--quiet", SOLOIST_UNIT])
     elif verb == "stop":
-        ok = quiet_ok(["systemctl", "--user", "stop", "spotifyd"])
+        ok = quiet_ok(["systemctl", "--user", "stop", SOLOIST_UNIT])
     elif verb == "restart":
-        ok = quiet_ok(["systemctl", "--user", "restart", "spotifyd"])
+        ok = quiet_ok(["systemctl", "--user", "restart", SOLOIST_UNIT])
     else:
         return fail("bad_args", "daemon action must be start, stop, or restart")
     if not ok:
-        return fail("daemon_failed", "systemctl --user %s spotifyd failed — check `journalctl --user -u spotifyd`" % verb)
+        return fail("daemon_failed", "systemctl --user %s soloist failed — check `journalctl --user -u soloist`" % verb)
+    time.sleep(1.0)
     out(app_state())
 
 
