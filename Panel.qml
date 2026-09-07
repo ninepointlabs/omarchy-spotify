@@ -620,6 +620,7 @@ Panel {
             Text {
               visible: root.service && root.service.authError !== ""
               width: parent.width
+              textFormat: Text.PlainText
               text: root.service ? root.service.authError : ""
               color: root.urgent
               font.family: root.fontFamily
@@ -1103,6 +1104,7 @@ Panel {
             Text {
               width: parent.width
               wrapMode: Text.Wrap
+              textFormat: Text.PlainText
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -1121,6 +1123,7 @@ Panel {
               visible: root.service && root.service.soloistError !== ""
               width: parent.width
               wrapMode: Text.Wrap
+              textFormat: Text.PlainText
               text: root.service ? root.service.soloistError : ""
               color: root.urgent
               font.family: root.fontFamily
@@ -1430,6 +1433,7 @@ Panel {
                   anchors.right: parent.right
                   anchors.verticalCenter: parent.verticalCenter
                   anchors.leftMargin: Style.space(4)
+                  textFormat: Text.PlainText
                   text: rowItem.modelData.kind === "note" ? rowItem.modelData.text : ""
                   color: rowItem.modelData.kind === "note" && rowItem.modelData.dim === false ? root.urgent : root.dim
                   font.family: root.fontFamily

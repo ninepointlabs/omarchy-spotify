@@ -20,7 +20,9 @@ Only Python's standard library is used.
 import argparse
 import base64
 import hashlib
+import html
 import json
+import re
 import os
 import secrets
 import shutil
@@ -58,6 +60,26 @@ LAST_PATH = os.path.join(STATE_DIR, "last-played.json")
 HTTP_TIMEOUT = 15
 ART_TIMEOUT = 8
 ART_WORKERS = 8
+ART_MAX_BYTES = 8 * 1024 * 1024
+
+SPOTIFY_ID_RE = re.compile(r"^[A-Za-z0-9]{1,64}$")
+SPOTIFY_URI_RE = re.compile(r"^spotify:[a-z_]+:[A-Za-z0-9:_-]{1,128}$")
+
+
+def safe_id(value):
+    """Spotify IDs are base62. Anything else must not reach a URL path."""
+    s = str(value or "").strip()
+    if not SPOTIFY_ID_RE.match(s):
+        raise ApiError("bad_args", "Not a Spotify ID: %r" % s[:40])
+    return s
+
+
+def safe_uris(values):
+    uris = [str(v or "").strip() for v in values]
+    for u in uris:
+        if not SPOTIFY_URI_RE.match(u):
+            raise ApiError("bad_args", "Not a Spotify URI: %r" % u[:60])
+    return uris
 
 
 # --------------------------------------------------------------------- output
@@ -323,11 +345,15 @@ def cache_one(url):
     path = art_path_for(url)
     if os.path.exists(path):
         return path
+    if not url.startswith("https://"):
+        return ""
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=ART_TIMEOUT) as resp:
-            blob = resp.read()
+            blob = resp.read(ART_MAX_BYTES + 1)
+        if len(blob) > ART_MAX_BYTES or not blob:
+            return ""
         tmp = path + ".%d.tmp" % os.getpid()
         with open(tmp, "wb") as fh:
             fh.write(blob)
@@ -653,8 +679,22 @@ SOLOIST_UNITS = ["soloist.service", "soloist-update.service", "soloist-update.ti
 SOLOIST_ARCHES = {"x86_64": "x86_64", "aarch64": "arm64", "armv7l": "arm32"}
 
 
+SOLOIST_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]{8,512}$")
+
+
+def clean_device_name(name):
+    """Printable, no quotes/backslashes/newlines, so it can't break out of the
+    env file or the unit's quoted argument."""
+    s = re.sub(r"[^\w .()\-]", "", str(name or ""), flags=re.UNICODE).strip()[:40]
+    return s or "Omarchy"
+
+
 def write_soloist_env(key=None, device_name=None):
     """Create or update ~/.config/soloist/soloist.env, keeping other lines."""
+    if key is not None and not SOLOIST_KEY_RE.match(key):
+        raise ApiError("bad_args", "That doesn't look like a Soloist API key")
+    if device_name is not None:
+        device_name = '"%s"' % clean_device_name(device_name)
     lines = []
     if os.path.exists(SOLOIST_ENV):
         with open(SOLOIST_ENV, "r", encoding="utf-8") as fh:
@@ -701,7 +741,9 @@ def download_soloist(dest):
             raise ApiError("download_failed", "Could not download Soloist: %s" % err)
         with tarfile.open(archive, "r:gz") as tar:
             member = tar.getmember("soloist")
-            tar.extract(member, tmp)
+            if not member.isreg():
+                raise ApiError("download_failed", "Soloist archive did not contain a regular file")
+            tar.extract(member, tmp, filter="data")
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         shutil.copyfile(os.path.join(tmp, "soloist"), dest + ".tmp")
         os.chmod(dest + ".tmp", 0o755)
@@ -729,6 +771,9 @@ def cmd_soloist(args):
         out(app_state())
     elif verb == "key":
         key = (args.value or "").strip()
+        if key == "-":
+            # Read from stdin so the key never appears in a process list.
+            key = sys.stdin.readline().strip()
         if not key:
             return fail("bad_args", "Paste the Soloist API key first")
         if not os.path.exists(SOLOIST_BIN):
@@ -802,8 +847,11 @@ class CallbackHandler(BaseHTTPRequestHandler):
             CallbackHandler.result = {"error": "state_mismatch"}
             body = "Login response did not match this request. Try connecting again."
         elif query.get("error"):
-            CallbackHandler.result = {"error": query["error"][0]}
-            body = "Spotify reported: %s. You can close this tab." % query["error"][0]
+            # Anything from the query string is untrusted: a page could send the
+            # browser here. Keep it short and escape it before it hits HTML.
+            reason = query["error"][0][:80]
+            CallbackHandler.result = {"error": reason}
+            body = "Spotify reported: %s. You can close this tab." % html.escape(reason)
         else:
             CallbackHandler.result = {"code": (query.get("code") or [""])[0]}
             body = "Connected to Spotify. You can close this tab and go back to your bar."
@@ -870,7 +918,7 @@ def cmd_auth(args):
     if not result:
         return fail("timeout", "Timed out waiting for Spotify to redirect back", {"authorizeUrl": authorize_url})
     if result.get("error"):
-        return fail("denied", "Spotify login failed: %s" % result["error"])
+        return fail("denied", "Spotify login failed: %s" % re.sub(r"[^A-Za-z0-9_ .-]", "", result["error"]))
 
     payload = token_request({
         "grant_type": "authorization_code",
@@ -962,11 +1010,11 @@ def with_device_fallback(fn, device_id=""):
 def cmd_play(args):
     body = {}
     if args.context:
-        body["context_uri"] = args.context
+        body["context_uri"] = safe_uris([args.context])[0]
     if args.uris:
-        body["uris"] = list(args.uris)
+        body["uris"] = safe_uris(args.uris)
     if args.offset_uri:
-        body["offset"] = {"uri": args.offset_uri}
+        body["offset"] = {"uri": safe_uris([args.offset_uri])[0]}
     elif args.offset_position is not None:
         body["offset"] = {"position": int(args.offset_position)}
     if args.position_ms is not None:
@@ -1034,8 +1082,10 @@ def cmd_transfer(args):
 
 
 def cmd_queue_add(args):
+    uri = safe_uris([args.uri])[0]
+
     def go(device_id):
-        params = {"uri": args.uri}
+        params = {"uri": uri}
         if device_id:
             params["device_id"] = device_id
         api("POST", "/me/player/queue", params)
@@ -1080,7 +1130,7 @@ def cmd_playlists(args):
 
 
 def cmd_playlist_items(args):
-    raw, total = paged("/playlists/%s/items" % args.id, {"limit": 100, "additional_types": "track,episode"}, int(args.limit))
+    raw, total = paged("/playlists/%s/items" % safe_id(args.id), {"limit": 100, "additional_types": "track,episode"}, int(args.limit))
     items = []
     for entry in raw:
         if not isinstance(entry, dict):
@@ -1110,8 +1160,9 @@ def cmd_audiobooks(args):
 
 
 def cmd_audiobook_chapters(args):
-    book = api("GET", "/audiobooks/%s" % args.id) or {}
-    raw, total = paged("/audiobooks/%s/chapters" % args.id, {"limit": 50}, int(args.limit))
+    book_id = safe_id(args.id)
+    book = api("GET", "/audiobooks/%s" % book_id) or {}
+    raw, total = paged("/audiobooks/%s/chapters" % book_id, {"limit": 50}, int(args.limit))
     parent = {"name": book.get("name", ""), "uri": book.get("uri", ""), "images": book.get("images")}
     items = [n for n in (norm_chapter(c, 64, parent) for c in raw) if n and n.get("uri")]
     out({"items": items, "total": int(total or len(items)), "book": cache_art([norm_audiobook(book, 300) or {}])[0]})
@@ -1129,16 +1180,18 @@ def cmd_shows(args):
 
 
 def cmd_show_episodes(args):
-    show = api("GET", "/shows/%s" % args.id) or {}
-    raw, total = paged("/shows/%s/episodes" % args.id, {"limit": 50}, int(args.limit))
+    show_id = safe_id(args.id)
+    show = api("GET", "/shows/%s" % show_id) or {}
+    raw, total = paged("/shows/%s/episodes" % show_id, {"limit": 50}, int(args.limit))
     parent = {"name": show.get("name", ""), "uri": show.get("uri", ""), "images": show.get("images")}
     items = [n for n in (norm_episode(e, 64, parent) for e in raw) if n and n.get("uri")]
     out({"items": cache_art(items), "total": int(total or len(items)), "show": cache_art([norm_show(show, 300) or {}])[0]})
 
 
 def cmd_album_tracks(args):
-    album = api("GET", "/albums/%s" % args.id) or {}
-    raw, total = paged("/albums/%s/tracks" % args.id, {"limit": 50}, int(args.limit))
+    album_id = safe_id(args.id)
+    album = api("GET", "/albums/%s" % album_id) or {}
+    raw, total = paged("/albums/%s/tracks" % album_id, {"limit": 50}, int(args.limit))
     art = art_url(album.get("images"), 64)
     items = []
     for t in raw:
@@ -1174,21 +1227,24 @@ def cmd_search(args):
 
 
 def cmd_library_contains(args):
-    payload = api("GET", "/me/library/contains", {"uris": ",".join(args.uris)})
+    uris = safe_uris(args.uris)
+    payload = api("GET", "/me/library/contains", {"uris": ",".join(uris)})
     flags = payload if isinstance(payload, list) else []
-    out({uri: bool(flag) for uri, flag in zip(args.uris, flags)})
+    out({uri: bool(flag) for uri, flag in zip(uris, flags)})
 
 
 def cmd_library_save(args):
     # The 2026 library endpoints take the URIs as a query parameter; a JSON
     # body is answered with "Missing required field: uris".
-    api("PUT", "/me/library", {"uris": ",".join(args.uris)})
-    out({"saved": list(args.uris)})
+    uris = safe_uris(args.uris)
+    api("PUT", "/me/library", {"uris": ",".join(uris)})
+    out({"saved": uris})
 
 
 def cmd_library_remove(args):
-    api("DELETE", "/me/library", {"uris": ",".join(args.uris)})
-    out({"removed": list(args.uris)})
+    uris = safe_uris(args.uris)
+    api("DELETE", "/me/library", {"uris": ",".join(uris)})
+    out({"removed": uris})
 
 
 # --------------------------------------------------------------------- main

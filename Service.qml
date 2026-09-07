@@ -17,7 +17,7 @@ Item {
   // support, stays inert once a shared one exists.
   property bool active: true
 
-  readonly property string pluginDir: Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "").replace(/\/$/, "")
+  readonly property string pluginDir: decodeURIComponent(Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "")).replace(/\/$/, "")
   readonly property string bridge: pluginDir + "/bin/spotify-bridge"
 
   function setting(name, fallback) {
@@ -136,7 +136,17 @@ Item {
     Process {
       id: proc
       property var callback: null
+      // Secrets go in through stdin, never argv, so they don't show up in
+      // the process list. Consumed on start and cleared.
+      property string stdinText: ""
       running: false
+      stdinEnabled: stdinText !== ""
+      onStarted: {
+        if (stdinText !== "") {
+          write(stdinText)
+          stdinText = ""
+        }
+      }
       stdout: StdioCollector { id: outCollector; waitForEnd: true }
       stderr: StdioCollector { id: errCollector; waitForEnd: true }
       onExited: function(exitCode, exitStatus) {
@@ -158,9 +168,9 @@ Item {
     }
   }
 
-  function call(args, callback) {
+  function call(args, callback, stdinText) {
     if (!active) return null
-    var proc = bridgeProcess.createObject(root, { command: [bridge].concat(args), callback: callback })
+    var proc = bridgeProcess.createObject(root, { command: [bridge].concat(args), callback: callback, stdinText: stdinText || "" })
     if (!proc) return null
     proc.running = true
     return proc
@@ -562,13 +572,13 @@ Item {
     if (soloistBusy) return
     soloistBusy = true
     soloistError = ""
-    call(["soloist", "key", k], function(result) {
+    call(["soloist", "key", "-"], function(result) {
       root.soloistBusy = false
       if (!result.ok) { root.soloistError = result.error; if (result.daemonInstalled !== undefined) root.applyDaemonState(result); return }
       root.applyDaemonState(result.data)
       root.flash(root.daemonPaired ? "Soloist is running" : "Soloist is running — pick “Omarchy” once in the Spotify app", false)
       appLaunchTimer.restart()
-    })
+    }, k + "\n")
   }
 
   function removeSoloist() {

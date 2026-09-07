@@ -246,6 +246,31 @@ Spotify's February 2026 rules for apps like this one shape a few things:
 search shows at most 10 results per type, other people's playlists don't
 expose their track lists, and the connection must be renewed every six months.
 
+## Security notes
+
+- **What is stored where.** Your Spotify login (a refresh token, no
+  password) lives in `~/.local/state/omarchy-spotify/auth.json`, and the
+  Soloist key in `~/.config/soloist/soloist.env`. Both are created with
+  mode 0600, readable only by your user. The Client ID in `shell.json` is
+  not a secret.
+- **Login is PKCE.** There is no client secret anywhere. The one-time
+  browser login talks to a listener on `127.0.0.1` only, checks the `state`
+  it issued, and escapes anything it echoes.
+- **No shell, no eval.** Every command the plugin runs is an argument list;
+  nothing from Spotify or from you is ever pasted into a shell string.
+  IDs and URIs are validated before they go into an API path. Text from
+  Spotify is rendered as plain text, never as rich text.
+- **Downloads.** Soloist comes over HTTPS from Spotify's CDN, is extracted
+  with Python's safe tar filter, and only the `soloist` file is kept. Cover
+  art is HTTPS-only and capped at 8 MB per image.
+- **Known limitation.** Soloist only accepts its API key on the command
+  line, so the key is visible in the process list to other users on the
+  same machine (`ps`). On a single-user desktop that's you; on a shared box,
+  treat it accordingly. The plugin itself passes the key over stdin.
+- **Nothing phones home.** The plugin talks to `api.spotify.com`,
+  `accounts.spotify.com`, Spotify's image CDN, and the Soloist download
+  host. That's the full list.
+
 ## License
 
 MIT. See `LICENSE`.
