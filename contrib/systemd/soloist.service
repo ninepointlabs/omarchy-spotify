@@ -1,3 +1,7 @@
+# Template. When the panel writes this file to ~/.config/systemd/user/, the
+# ExecStart placeholder below is replaced with the path of the soloist binary
+# already on this machine. The plugin never downloads or replaces that binary;
+# keeping it current is your package manager's job (or yours).
 [Unit]
 Description=Spotify Soloist — headless Spotify Connect device
 Documentation=https://developer.spotify.com/documentation/soloist
@@ -9,7 +13,7 @@ Type=simple
 EnvironmentFile=%h/.config/soloist/soloist.env
 # Refuse to start until the API key has been filled in.
 ExecStartPre=/bin/sh -c 'test -n "$SOLOIST_API_KEY" || { echo "SOLOIST_API_KEY is empty in ~/.config/soloist/soloist.env" >&2; exit 1; }'
-ExecStart=%h/.local/bin/soloist \
+ExecStart=@SOLOIST_BIN@ \
   --device-name "${SOLOIST_DEVICE_NAME}" \
   --api-key "${SOLOIST_API_KEY}" \
   --data-dir %h/.local/share/soloist \
@@ -19,8 +23,8 @@ ExecStart=%h/.local/bin/soloist \
   --ws 127.0.0.1:0
 Restart=on-failure
 RestartSec=5
-# Exit code 10 means the build expired (90-day limit); restarting won't help,
-# the weekly soloist-update.timer replaces the binary.
+# Exit code 10 means the build expired (Spotify's builds stop working after 90
+# days); restarting won't help. Update Soloist the same way you installed it.
 RestartPreventExitStatus=10
 
 [Install]

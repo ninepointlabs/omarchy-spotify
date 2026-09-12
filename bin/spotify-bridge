@@ -595,6 +595,56 @@ def quiet_ok(argv):
 
 SOLOIST_ENV = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "soloist", "soloist.env")
 SOLOIST_UNIT = "soloist"
+SOLOIST_SERVICE = "soloist.service"
+SYSTEMD_USER_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "systemd", "user")
+OUR_UNIT = os.path.join(SYSTEMD_USER_DIR, SOLOIST_SERVICE)
+# Stamped into the unit file this plugin writes, so "Remove Soloist" only ever
+# deletes a unit this plugin created and never one from a package.
+UNIT_MARKER = "# Managed by the ninepointlabs.spotify Omarchy plugin"
+# Units this plugin wrote before the marker existed carried no stamp. Recognise
+# them by the shape they always had, so an upgrade can still manage and remove
+# them instead of mistaking them for a unit from a package.
+LEGACY_UNIT_FINGERPRINT = (
+    "Documentation=https://developer.spotify.com/documentation/soloist",
+    "--ws 127.0.0.1:0",
+)
+# The weekly re-download timer an earlier version of this plugin installed.
+# That path is gone; these names survive only so the plugin can take the units
+# back off machines that still have them. Nothing re-creates them.
+LEGACY_UPDATE_UNITS = ["soloist-update.service", "soloist-update.timer"]
+LEGACY_UPDATER = os.path.join(HOME, ".local", "bin", "soloist-update")
+
+SOLOIST_MISSING_HINT = (
+    "No soloist binary found. Install Spotify Soloist yourself first, then click Set up "
+    "again: on Arch/Omarchy the AUR package spotify-soloist-bin, otherwise the download "
+    "linked from https://developer.spotify.com/documentation/soloist. This plugin "
+    "deliberately does not fetch it — Spotify publishes no checksum and no signature "
+    "for those builds, so a download could not be verified against anything."
+)
+
+
+def unit_is_ours():
+    """True when ~/.config/systemd/user/soloist.service is a file this plugin
+    wrote. A unit from a package (which lives under /usr) or one the user wrote
+    by hand is never ours to rewrite or delete."""
+    try:
+        with open(OUR_UNIT, "r", encoding="utf-8") as fh:
+            body = fh.read()
+    except OSError:
+        return False
+    return UNIT_MARKER in body or all(line in body for line in LEGACY_UNIT_FINGERPRINT)
+
+
+def find_soloist():
+    """Locate a soloist binary the user installed themselves — a distro
+    package, or their own unpacked copy in ~/.local/bin. The plugin only ever
+    reads this; it never downloads, installs or replaces the binary."""
+    path = shutil.which("soloist")
+    if not path:
+        local = os.path.join(HOME, ".local", "bin", "soloist")
+        if os.path.isfile(local) and os.access(local, os.X_OK):
+            path = local
+    return path or ""
 
 
 def systemctl_user(*args):
@@ -606,12 +656,12 @@ def systemctl_user(*args):
 
 
 def soloist_state():
-    """Spotify Soloist — Spotify's own headless Connect client, run here as a
-    systemd user service. librespot-based daemons (spotifyd, spotify-player)
-    no longer get audio keys for newer accounts, so Soloist is what the panel
-    offers to start."""
-    binary = shutil.which("soloist") or (os.path.join(HOME, ".local", "bin", "soloist")
-                                          if os.path.exists(os.path.join(HOME, ".local", "bin", "soloist")) else "")
+    """Spotify Soloist — Spotify's own headless Connect client. librespot-based
+    daemons (spotifyd, spotify-player) no longer get audio keys for newer
+    accounts, so Soloist is what the panel drives. The user installs the
+    binary; this plugin only finds it and wires a systemd *user* service
+    around it."""
+    binary = find_soloist()
     configured = False
     if os.path.exists(SOLOIST_ENV):
         try:
@@ -622,6 +672,10 @@ def soloist_state():
                         configured = True
         except OSError:
             configured = False
+    # A unit may come from this plugin (~/.config/systemd/user) or from a
+    # package the user installed. Only the first kind is ours to delete.
+    unit_path = systemctl_user("show", "-p", "FragmentPath", "--value", SOLOIST_SERVICE)[1]
+    managed = unit_is_ours()
     running = bool(binary) and systemctl_user("is-active", "--quiet", SOLOIST_UNIT)[0] == 0
     _, exit_status = systemctl_user("show", "-p", "ExecMainStatus", "--value", SOLOIST_UNIT)
     expired = bool(binary) and not running and exit_status == "10"
@@ -631,13 +685,23 @@ def soloist_state():
         paired = any(not name.startswith("ws.") for name in os.listdir(data_dir))
     except OSError:
         paired = False
+    legacy = os.path.exists(LEGACY_UPDATER) or any(
+        os.path.exists(os.path.join(SYSTEMD_USER_DIR, unit)) for unit in LEGACY_UPDATE_UNITS)
     return {
         "daemonName": "Soloist",
         "daemonInstalled": bool(binary),
+        "daemonPath": binary,
+        "daemonUnit": bool(unit_path) or os.path.exists(OUR_UNIT),
+        "daemonManaged": managed,
+        "daemonForeignUnit": (bool(unit_path) or os.path.exists(OUR_UNIT)) and not managed,
         "daemonConfigured": configured,
         "daemonRunning": running,
         "daemonExpired": expired,
         "daemonPaired": paired,
+        # True while a machine still carries the weekly re-download timer an
+        # earlier version of this plugin installed, so the panel can offer to
+        # take it off.
+        "legacyUpdater": legacy,
     }
 
 
@@ -672,14 +736,11 @@ def cmd_status(args):
 
 
 PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SOLOIST_BIN = os.path.join(HOME, ".local", "bin", "soloist")
-SOLOIST_UPDATER = os.path.join(HOME, ".local", "bin", "soloist-update")
-SYSTEMD_USER_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "systemd", "user")
-SOLOIST_UNITS = ["soloist.service", "soloist-update.service", "soloist-update.timer"]
-SOLOIST_ARCHES = {"x86_64": "x86_64", "aarch64": "arm64", "armv7l": "arm32"}
-
 
 SOLOIST_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]{8,512}$")
+# An absolute path with nothing in it that could break out of the unit file's
+# ExecStart line (no whitespace, quotes, backslashes, newlines or %-specifiers).
+SOLOIST_BIN_RE = re.compile(r"^/[A-Za-z0-9._+@/-]+$")
 
 
 def clean_device_name(name):
@@ -724,50 +785,73 @@ def write_soloist_env(key=None, device_name=None):
     os.replace(SOLOIST_ENV + ".tmp", SOLOIST_ENV)
 
 
-def download_soloist(dest):
-    import tarfile
-    import tempfile
-    arch = SOLOIST_ARCHES.get(os.uname().machine)
-    if not arch:
-        raise ApiError("unsupported", "Soloist has no build for %s" % os.uname().machine)
-    url = "https://soloist-builds.spotifycdn.com/soloist_release_%s.tar.gz" % arch
-    with tempfile.TemporaryDirectory() as tmp:
-        archive = os.path.join(tmp, "soloist.tar.gz")
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        try:
-            with urllib.request.urlopen(req, timeout=60) as resp, open(archive, "wb") as fh:
-                shutil.copyfileobj(resp, fh)
-        except Exception as err:
-            raise ApiError("download_failed", "Could not download Soloist: %s" % err)
-        with tarfile.open(archive, "r:gz") as tar:
-            member = tar.getmember("soloist")
-            if not member.isreg():
-                raise ApiError("download_failed", "Soloist archive did not contain a regular file")
-            tar.extract(member, tmp, filter="data")
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        shutil.copyfile(os.path.join(tmp, "soloist"), dest + ".tmp")
-        os.chmod(dest + ".tmp", 0o755)
-        os.replace(dest + ".tmp", dest)
+def write_soloist_unit(binary):
+    """Render contrib/systemd/soloist.service for the binary the user already
+    has, into ~/.config/systemd/user. The path is matched against a strict
+    pattern first so nothing can be smuggled into the unit file."""
+    if not SOLOIST_BIN_RE.match(binary):
+        raise ApiError("bad_binary", "Refusing to write a unit for this soloist path")
+    template = os.path.join(PLUGIN_DIR, "contrib", "systemd", SOLOIST_SERVICE)
+    try:
+        with open(template, "r", encoding="utf-8") as fh:
+            body = fh.read()
+    except OSError as err:
+        raise ApiError("no_template", "Could not read contrib/systemd/%s: %s" % (SOLOIST_SERVICE, err))
+    if "@SOLOIST_BIN@" not in body:
+        raise ApiError("no_template", "contrib/systemd/%s has no @SOLOIST_BIN@ placeholder" % SOLOIST_SERVICE)
+    os.makedirs(SYSTEMD_USER_DIR, exist_ok=True)
+    with open(OUR_UNIT + ".tmp", "w", encoding="utf-8") as fh:
+        fh.write(UNIT_MARKER + "\n" + body.replace("@SOLOIST_BIN@", binary))
+    os.replace(OUR_UNIT + ".tmp", OUR_UNIT)
+
+
+def remove_quietly(path):
+    try:
+        os.remove(path)
+        return True
+    except OSError:
+        return False
+
+
+def drop_legacy_updater():
+    """Take the weekly re-download timer an earlier version of this plugin
+    installed back off. Nothing in the plugin re-creates it."""
+    systemctl_user("disable", "--now", "--quiet", "soloist-update.timer", "soloist-update.service")
+    removed = False
+    for unit in LEGACY_UPDATE_UNITS:
+        removed = remove_quietly(os.path.join(SYSTEMD_USER_DIR, unit)) or removed
+    removed = remove_quietly(LEGACY_UPDATER) or removed
+    if removed:
+        systemctl_user("daemon-reload")
+    return removed
 
 
 def cmd_soloist(args):
-    """One-button Soloist setup: install/update the binary, service units and
-    updater; store the API key; remove everything again."""
+    """Wire a systemd user service around a Soloist binary the user installed
+    themselves, store the API key, and take the plugin's own files back off.
+
+    There is deliberately no install or update action. Spotify serves its
+    Soloist builds from one mutable URL with no checksum, no signature and no
+    release manifest, so a download could not be bound to any reviewed
+    artifact — the plugin leaves getting the binary to a package manager or to
+    the user."""
     verb = args.action
-    if verb == "install":
-        download_soloist(SOLOIST_BIN)
-        contrib = os.path.join(PLUGIN_DIR, "contrib")
-        os.makedirs(SYSTEMD_USER_DIR, exist_ok=True)
-        for unit in SOLOIST_UNITS:
-            shutil.copyfile(os.path.join(contrib, "systemd", unit), os.path.join(SYSTEMD_USER_DIR, unit))
-        shutil.copyfile(os.path.join(contrib, "soloist-update"), SOLOIST_UPDATER)
-        os.chmod(SOLOIST_UPDATER, 0o755)
+    if verb == "setup":
+        binary = find_soloist()
+        if not binary:
+            return fail("no_daemon", SOLOIST_MISSING_HINT, soloist_state())
+        # Any machine reaching setup should not keep the old updater around.
+        drop_legacy_updater()
+        state = soloist_state()
+        # A unit from a package (soloistd and friends) stays the user's to
+        # manage; shadowing it from ~/.config would be a surprise.
+        if not state["daemonForeignUnit"]:
+            write_soloist_unit(binary)
         if not os.path.exists(SOLOIST_ENV):
             write_soloist_env(device_name=args.device_name or "Omarchy")
         elif args.device_name:
             write_soloist_env(device_name=args.device_name)
         systemctl_user("daemon-reload")
-        systemctl_user("enable", "--now", "--quiet", "soloist-update.timer")
         out(app_state())
     elif verb == "key":
         key = (args.value or "").strip()
@@ -776,41 +860,48 @@ def cmd_soloist(args):
             key = sys.stdin.readline().strip()
         if not key:
             return fail("bad_args", "Paste the Soloist API key first")
-        if not os.path.exists(SOLOIST_BIN):
-            return fail("no_daemon", "Install Soloist first")
+        binary = find_soloist()
+        if not binary:
+            return fail("no_daemon", SOLOIST_MISSING_HINT, soloist_state())
         write_soloist_env(key=key)
+        state = soloist_state()
+        if not state["daemonUnit"]:
+            write_soloist_unit(binary)
         systemctl_user("daemon-reload")
-        code, _ = systemctl_user("enable", "--now", "soloist")
+        code, _ = systemctl_user("enable", "--now", SOLOIST_UNIT)
         time.sleep(1.5)
         state = app_state()
         if code != 0 or not state["daemonRunning"]:
             return fail("daemon_failed", "Soloist did not start — check `journalctl --user -u soloist`", state)
         out(state)
     elif verb == "remove":
-        systemctl_user("disable", "--now", "--quiet", "soloist", "soloist-update.timer")
-        for unit in SOLOIST_UNITS:
-            try:
-                os.remove(os.path.join(SYSTEMD_USER_DIR, unit))
-            except OSError:
-                pass
-        for path in (SOLOIST_BIN, SOLOIST_UPDATER):
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+        # Only what this plugin created: the user unit it wrote, plus any
+        # leftovers of the old updater. The binary belongs to the user (or to
+        # their package manager) and is never touched.
+        systemctl_user("disable", "--now", "--quiet", SOLOIST_UNIT)
+        if soloist_state()["daemonManaged"]:
+            remove_quietly(OUR_UNIT)
+        drop_legacy_updater()
         systemctl_user("daemon-reload")
         out(app_state())
+    elif verb == "drop-updater":
+        dropped = drop_legacy_updater()
+        state = app_state()
+        state["updaterRemoved"] = dropped
+        out(state)
     else:
-        return fail("bad_args", "soloist action must be install, key, or remove")
+        return fail("bad_args", "soloist action must be setup, key, remove, or drop-updater")
 
 
 def cmd_daemon(args):
     """Start/stop the Soloist user service so the panel has a device."""
     state = soloist_state()
     if not state["daemonInstalled"]:
-        return fail("no_daemon", "Spotify Soloist is not installed — see the README")
+        return fail("no_daemon", SOLOIST_MISSING_HINT, state)
+    if not state["daemonUnit"]:
+        return fail("no_unit", "No soloist.service yet — use Set up Soloist in the panel first", state)
     if not state["daemonConfigured"]:
-        return fail("daemon_unconfigured", "Add your Soloist API key to ~/.config/soloist/soloist.env first")
+        return fail("daemon_unconfigured", "Add your Soloist API key to ~/.config/soloist/soloist.env first", state)
     verb = args.action
     if verb == "start":
         ok = quiet_ok(["systemctl", "--user", "start", SOLOIST_UNIT])

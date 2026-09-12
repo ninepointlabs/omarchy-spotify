@@ -37,12 +37,25 @@ Item {
   property bool appInstalled: false
   property bool appRunning: false
   // Spotify Soloist: the headless Spotify Connect device, run as a systemd
-  // user service. Installed/configured/running/expired come from the bridge.
+  // user service. The user installs the binary themselves; the bridge reports
+  // whether it found one, whether a soloist.service exists (and whether this
+  // plugin wrote it), and how the service is doing.
   property bool daemonInstalled: false
+  property string daemonPath: ""
+  property bool daemonUnit: false
+  property bool daemonManaged: false
+  property bool daemonForeignUnit: false
   property bool daemonConfigured: false
   property bool daemonRunning: false
   property bool daemonExpired: false
   property bool daemonPaired: false
+  // An old version of this plugin installed a weekly timer that re-downloaded
+  // the Soloist binary. It is gone; this flags machines that still carry it so
+  // the panel can offer to take it off.
+  property bool legacyUpdater: false
+  // Ready to start: a binary was found, a soloist.service exists, and the key
+  // is in place.
+  readonly property bool daemonReady: daemonInstalled && daemonUnit && daemonConfigured
   readonly property bool hasLocalDevice: appInstalled || daemonInstalled
   property string storedClientId: ""
   property var user: ({})
@@ -220,10 +233,15 @@ Item {
       root.appInstalled = d.appInstalled === true
       root.appRunning = d.appRunning === true
       root.daemonInstalled = d.daemonInstalled === true
+      root.daemonPath = d.daemonPath || ""
+      root.daemonUnit = d.daemonUnit === true
+      root.daemonManaged = d.daemonManaged === true
+      root.daemonForeignUnit = d.daemonForeignUnit === true
       root.daemonConfigured = d.daemonConfigured === true
       root.daemonRunning = d.daemonRunning === true
       root.daemonExpired = d.daemonExpired === true
       root.daemonPaired = d.daemonPaired === true
+      root.legacyUpdater = d.legacyUpdater === true
       root.user = d.user || {}
       root.lastPlayed = d.lastPlayed || {}
       if (root.authenticated) {
@@ -540,29 +558,51 @@ Item {
     appLaunchTimer.restart()
   }
 
-  // ---- One-button Soloist setup (download + units + key), driven from the panel.
+  // ---- Soloist setup, driven from the panel. This only ever writes local
+  //      config: the systemd *user* unit and the env file. Getting the binary
+  //      is the user's job (package manager or Spotify's own download), because
+  //      Spotify ships no checksum or signature to verify a download against.
   property bool soloistBusy: false
   property string soloistError: ""
 
   function applyDaemonState(d) {
     daemonInstalled = d.daemonInstalled === true
+    daemonPath = d.daemonPath || ""
+    daemonUnit = d.daemonUnit === true
+    daemonManaged = d.daemonManaged === true
+    daemonForeignUnit = d.daemonForeignUnit === true
     daemonConfigured = d.daemonConfigured === true
     daemonRunning = d.daemonRunning === true
     daemonExpired = d.daemonExpired === true
     daemonPaired = d.daemonPaired === true
+    legacyUpdater = d.legacyUpdater === true
     appInstalled = d.appInstalled === true
     appRunning = d.appRunning === true
   }
 
-  function installSoloist() {
+  function setUpSoloist() {
     if (soloistBusy) return
     soloistBusy = true
     soloistError = ""
-    call(["soloist", "install"], function(result) {
+    call(["soloist", "setup"], function(result) {
+      root.soloistBusy = false
+      if (!result.ok) { root.soloistError = result.error; if (result.daemonInstalled !== undefined) root.applyDaemonState(result); return }
+      root.applyDaemonState(result.data)
+      root.flash("Soloist service ready — paste your API key", false)
+    })
+  }
+
+  // Removes the weekly re-download timer an old version of this plugin left
+  // behind. Nothing re-creates it.
+  function dropSoloistUpdater() {
+    if (soloistBusy) return
+    soloistBusy = true
+    soloistError = ""
+    call(["soloist", "drop-updater"], function(result) {
       root.soloistBusy = false
       if (!result.ok) { root.soloistError = result.error; return }
       root.applyDaemonState(result.data)
-      root.flash("Soloist installed — paste your API key", false)
+      root.flash("Removed the old Soloist auto-updater", false)
     })
   }
 
@@ -588,18 +628,16 @@ Item {
       root.soloistBusy = false
       if (!result.ok) { root.soloistError = result.error; return }
       root.applyDaemonState(result.data)
-      root.flash("Soloist removed", false)
+      root.flash("Soloist service removed — the binary itself was left alone", false)
     })
   }
 
   function startDaemon() {
     call(["daemon", "start"], function(result) {
       if (!result.ok) { root.flash(result.error, true); return }
-      root.daemonRunning = result.data.daemonRunning === true
-      root.daemonExpired = result.data.daemonExpired === true
-      root.daemonPaired = result.data.daemonPaired === true
+      root.applyDaemonState(result.data)
       if (root.daemonRunning) root.flash(root.daemonPaired ? "Soloist started" : "Soloist started — pick “Omarchy” once in the Spotify app to pair it", false)
-      else root.flash(root.daemonExpired ? "Soloist build expired — run soloist-update" : "Soloist did not stay up — see journalctl --user -u soloist", true)
+      else root.flash(root.daemonExpired ? "Soloist build expired — update it with your package manager" : "Soloist did not stay up — see journalctl --user -u soloist", true)
       appLaunchTimer.restart()
     })
   }

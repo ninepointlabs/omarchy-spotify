@@ -91,9 +91,10 @@ Panel {
     if (!authenticated) return ""
     if (service.premiumRequired) return "Spotify Premium is required for playback control"
     if (playerActive && service.deviceName !== "") return (isPlaying ? "Playing on " : "Paused on ") + service.deviceName
-    if (service.daemonExpired) return "Soloist build expired — run soloist-update"
+    if (service.daemonExpired) return "Soloist build expired — update it with your package manager"
+    if (service.daemonInstalled && !service.daemonUnit) return "Soloist is installed — set up its service to play here"
     if (service.daemonInstalled && !service.daemonConfigured) return "Soloist needs its API key in ~/.config/soloist/soloist.env"
-    if (service.daemonInstalled && !service.daemonRunning) return "Soloist isn't running — start it to play here"
+    if (service.daemonReady && !service.daemonRunning) return "Soloist isn't running — start it to play here"
     if (service.daemonRunning && !service.daemonPaired) return "Pick “Omarchy” once in the Spotify app to pair Soloist"
     if (service.noDevice) return "No active device — pick one or start a player"
     if (service.user && service.user.name) return "Connected as " + service.user.name
@@ -647,7 +648,7 @@ Panel {
               Text {
                 textFormat: Text.PlainText
                 width: parent.width
-                text: "This panel needs a player to drive: the Spotify desktop app, or the headless Spotify Soloist daemon (see the README). Neither is installed yet."
+                text: "This panel needs a player to drive: the Spotify desktop app, or the headless Spotify Soloist daemon (install either one yourself — see the README). Neither is installed yet."
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
@@ -925,7 +926,7 @@ Panel {
               spacing: Style.space(8)
 
               Button {
-                visible: root.service && root.service.daemonInstalled && root.service.daemonConfigured && !root.service.daemonRunning
+                visible: root.service && root.service.daemonReady && !root.service.daemonRunning
                 text: "Start Soloist"
                 iconText: Model.glyph.play
                 bordered: true
@@ -1055,7 +1056,7 @@ Panel {
               topPadding: Style.space(2)
 
               Button {
-                visible: root.service && root.service.daemonInstalled && root.service.daemonConfigured
+                visible: root.service && root.service.daemonReady
                 text: root.service && root.service.daemonRunning ? "Restart Soloist" : "Start Soloist"
                 iconText: Model.glyph.play
                 foreground: root.foreground
@@ -1106,8 +1107,12 @@ Panel {
               }
             }
 
-            // ---- Headless player: Spotify Soloist, set up from here in
-            //      two pastes (install, then the account's API key).
+            // ---- Headless player: Spotify Soloist. The binary is the user's
+            //      to install (package manager or Spotify's own download); the
+            //      panel only finds it and wires up a systemd user service and
+            //      the API key around it. It never fetches an executable —
+            //      Spotify publishes no checksum or signature for its Soloist
+            //      builds, so a download could not be verified.
             PanelSectionHeader {
               topPadding: Style.space(8)
               text: "HEADLESS PLAYER"
@@ -1124,13 +1129,56 @@ Panel {
               font.pixelSize: Style.font.bodySmall
               text: {
                 if (!root.service) return ""
-                if (!root.service.daemonInstalled) return "Spotify Soloist plays with no window: Spotify's own headless Connect device, run as a background service. Premium required."
-                if (!root.service.daemonConfigured) return "Installed. Now generate a key at developer.spotify.com/dashboard → “Spotify Soloist API Key”, and paste it here."
-                if (root.service.daemonExpired) return "The Soloist build expired. Reinstall to fetch the current one."
+                if (!root.service.daemonInstalled) return "Spotify Soloist plays with no window: Spotify's own headless Connect device, run as a background service. Premium required. Install it yourself first — this panel does not download it."
+                if (!root.service.daemonUnit) return "Found soloist at " + root.service.daemonPath + ". Click Set up Soloist to add the background service for it."
+                if (!root.service.daemonConfigured && root.service.daemonForeignUnit) return "A soloist.service from your system is in charge here, so the plugin left it alone. Generate a key at developer.spotify.com/dashboard → “Spotify Soloist API Key”; paste it below if that unit reads ~/.config/soloist/soloist.env, otherwise configure it however that package documents."
+                if (!root.service.daemonConfigured) return "Service ready. Now generate a key at developer.spotify.com/dashboard → “Spotify Soloist API Key”, and paste it here."
+                if (root.service.daemonExpired) return "The Soloist build expired after 90 days. Update it the way you installed it, then start it again."
                 if (!root.service.daemonRunning) return "Soloist is installed but stopped."
                 if (!root.service.daemonPaired) return "Soloist is running as “Omarchy”. Pick it once in the Spotify app's device picker to pair; after that it appears above."
                 return "Soloist is running as “Omarchy”."
               }
+            }
+
+            // Where to get it. Deliberately text only: the panel points at a
+            // trusted install source instead of fetching anything itself.
+            Text {
+              visible: root.service && !root.service.daemonInstalled
+              width: parent.width
+              wrapMode: Text.Wrap
+              textFormat: Text.PlainText
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              text: "Get the binary from a source you trust, not from this panel:\n  ·  your package manager — on Arch/Omarchy the AUR package spotify-soloist-bin\n  ·  or Spotify's own instructions at developer.spotify.com/documentation/soloist\nOnce a soloist binary is on your PATH (or in ~/.local/bin), come back here."
+            }
+
+            // A weekly auto-updater that an older version of this plugin
+            // installed: offer to take it off, since nothing re-creates it.
+            Text {
+              visible: root.service && root.service.legacyUpdater
+              width: parent.width
+              wrapMode: Text.Wrap
+              textFormat: Text.PlainText
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              text: "An older version of this plugin left a weekly timer here that re-downloaded the Soloist binary. This version does not do that. Remove the leftover timer:"
+            }
+
+            Button {
+              visible: root.service && root.service.legacyUpdater
+              text: root.service && root.service.soloistBusy ? "Removing…" : "Remove the old auto-updater"
+              bordered: true
+              foreground: root.foreground
+              background: Color.popups.background
+              accent: root.accent
+              fontFamily: root.fontFamily
+              fontSize: Style.font.bodySmall
+              horizontalPadding: Style.space(10)
+              verticalPadding: Style.space(4)
+              enabled: !(root.service && root.service.soloistBusy)
+              onClicked: if (root.service) root.service.dropSoloistUpdater()
             }
 
             Text {
@@ -1145,7 +1193,7 @@ Panel {
             }
 
             Row {
-              visible: root.service && root.service.daemonInstalled && !root.service.daemonConfigured
+              visible: root.service && root.service.daemonInstalled && root.service.daemonUnit && !root.service.daemonConfigured
               width: parent.width
               spacing: Style.space(8)
 
@@ -1183,25 +1231,23 @@ Panel {
               spacing: Style.space(6)
 
               Button {
-                visible: root.service && (!root.service.daemonInstalled || root.service.daemonExpired)
-                text: root.service && root.service.soloistBusy ? "Downloading…" : (root.service && root.service.daemonExpired ? "Reinstall Soloist" : "Set up Soloist…")
-                iconText: Model.glyph.external
+                visible: root.service && root.service.daemonInstalled && !root.service.daemonUnit
+                text: root.service && root.service.soloistBusy ? "Setting up…" : "Set up Soloist"
                 bordered: true
                 foreground: root.foreground
                 background: Color.popups.background
                 accent: root.accent
                 fontFamily: root.fontFamily
                 fontSize: Style.font.bodySmall
-                iconSize: Style.font.body
                 horizontalPadding: Style.space(10)
                 verticalPadding: Style.space(4)
                 enabled: !(root.service && root.service.soloistBusy)
-                onClicked: if (root.service) root.service.installSoloist()
+                onClicked: if (root.service) root.service.setUpSoloist()
               }
 
               Button {
-                visible: root.service && root.service.daemonInstalled && root.service.daemonConfigured
-                text: "Remove Soloist"
+                visible: root.service && (root.service.daemonManaged || root.service.legacyUpdater)
+                text: "Remove Soloist service"
                 foreground: root.foreground
                 accent: root.accent
                 fontFamily: root.fontFamily
