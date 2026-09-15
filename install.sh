@@ -4,8 +4,13 @@
 
 set -euo pipefail
 
+# Take every tool from the system directories, not from whatever PATH the
+# calling shell carries.
+PATH=/usr/bin:/bin:/usr/share/omarchy/bin
+export PATH
+
 src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$src/manifest.json")"
+id="$(/usr/bin/python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$src/manifest.json")"
 dest="$HOME/.config/omarchy/plugins/$id"
 
 mkdir -p "$dest"

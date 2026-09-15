@@ -20,6 +20,34 @@ Item {
   readonly property string pluginDir: decodeURIComponent(Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "")).replace(/\/$/, "")
   readonly property string bridge: pluginDir + "/bin/spotify-bridge"
 
+  // ---- Trust boundary. Nothing here starts a program through the session
+  //      PATH or hands it the session environment. The bridge runs under an
+  //      absolute Python found once at startup (`python3 -I`, never the
+  //      script's own interpreter line) in a cleared environment; the few
+  //      detached launches use absolute paths the bridge resolved from
+  //      root-owned directories, re-checked in Model.js. See Model.js's
+  //      "Trusted executables and closed environments".
+  function sessionValues(names) {
+    var values = {}
+    for (var i = 0; i < names.length; i++) values[names[i]] = Quickshell.env(names[i])
+    return values
+  }
+  readonly property var bridgeEnvironment: Model.closedEnvironment(sessionValues(Model.bridgeEnvironmentNames), Model.bridgeEnvironmentNames, Model.trustedPathEnvironment)
+  readonly property var launchEnvironment: Model.closedEnvironment(sessionValues(Model.launchEnvironmentNames), Model.launchEnvironmentNames, Model.trustedSessionPathEnvironment, Model.launchFixedEnvironment)
+  readonly property var pythonProbeEnvironment: Model.closedEnvironment({}, [], Model.trustedPathEnvironment)
+
+  property string python: ""
+  property string pythonError: ""
+  property bool _pythonProbing: false
+  property int _pythonAttempt: 0
+  property int _pythonProbeWaits: 0
+  property var _pythonProbeObject: null
+  property int _pythonCandidate: 0
+  property var _queuedCalls: []
+  // Absolute launcher paths reported by `spotify-bridge status`.
+  property var tools: ({})
+  property string appBinary: ""
+
   function setting(name, fallback) {
     var value = settings ? settings[name] : undefined
     return value === undefined || value === null ? fallback : value
@@ -153,6 +181,8 @@ Item {
       // the process list. Consumed on start and cleared.
       property string stdinText: ""
       running: false
+      clearEnvironment: true
+      environment: root.bridgeEnvironment
       stdinEnabled: stdinText !== ""
       onStarted: {
         if (stdinText !== "") {
@@ -183,10 +213,142 @@ Item {
 
   function call(args, callback, stdinText) {
     if (!active) return null
-    var proc = bridgeProcess.createObject(root, { command: [bridge].concat(args), callback: callback, stdinText: stdinText || "" })
+    if (python === "" && pythonError === "") {
+      // Calls made before the interpreter is known wait for the probe.
+      var queued = _queuedCalls
+      queued.push({ args: args, callback: callback, stdinText: stdinText || "" })
+      _queuedCalls = queued
+      resolvePython()
+      return null
+    }
+    var command = python === "" ? [] : Model.bridgeCommand(python, bridge, args)
+    if (command.length === 0) {
+      // Fail closed: no trusted interpreter means no bridge call at all.
+      var failure = { ok: false, code: "no_python", error: pythonError || "Could not build the spotify-bridge command" }
+      if (callback) Qt.callLater(function() { callback(failure) })
+      return null
+    }
+    var proc = bridgeProcess.createObject(root, { command: command, callback: callback, stdinText: stdinText || "" })
     if (!proc) return null
     proc.running = true
     return proc
+  }
+
+  function resolvePython() {
+    if (python !== "" || pythonError !== "" || _pythonProbing) return
+    _pythonCandidate = 0
+    probeNextPython()
+  }
+
+  // Walk the absolute candidates in order; the first that starts and reports
+  // a usable Python 3 is the bridge's interpreter for the life of the shell.
+  // Each attempt is its own Process tagged with its number, so a late exit
+  // from an abandoned attempt can never settle a later one.
+  function probeNextPython() {
+    var command = []
+    while (command.length === 0 && _pythonCandidate < Model.pythonCandidates.length) {
+      command = Model.pythonProbeCommand(Model.pythonCandidates[_pythonCandidate])
+      if (command.length === 0) _pythonCandidate++
+    }
+    if (command.length === 0) {
+      _pythonProbing = false
+      pythonError = "No Python 3 found in " + Model.trustedBinaryDirectories.join(", ")
+        + " — the Spotify plugin will not run python3 from your PATH"
+      flushQueuedCalls()
+      return
+    }
+    _pythonProbing = true
+    _pythonAttempt++
+    _pythonProbeWaits = 0
+    var probe = pythonProbeProcess.createObject(root, { command: command, attempt: _pythonAttempt })
+    if (!probe) { settlePythonProbe(_pythonAttempt, false, -1); return }
+    _pythonProbeObject = probe
+    pythonProbeWatchdog.restart()
+    probe.running = true
+  }
+
+  function settlePythonProbe(attempt, started, exitCode) {
+    if (!_pythonProbing || attempt !== _pythonAttempt) return
+    pythonProbeWatchdog.stop()
+    _pythonProbeObject = null
+    if (started && exitCode === 0) {
+      _pythonProbing = false
+      python = Model.pythonCandidates[_pythonCandidate]
+      flushQueuedCalls()
+      return
+    }
+    _pythonCandidate++
+    probeNextPython()
+  }
+
+  function flushQueuedCalls() {
+    var queued = _queuedCalls
+    _queuedCalls = []
+    for (var i = 0; i < queued.length; i++) call(queued[i].args, queued[i].callback, queued[i].stdinText)
+  }
+
+  Component {
+    id: pythonProbeProcess
+
+    Process {
+      id: probeProc
+      property int attempt: 0
+      property bool started: false
+      running: false
+      clearEnvironment: true
+      environment: root.pythonProbeEnvironment
+      onStarted: started = true
+      onExited: function(exitCode) {
+        root.settlePythonProbe(probeProc.attempt, probeProc.started, exitCode)
+        probeProc.destroy()
+      }
+    }
+  }
+
+  // Quickshell emits no exit at all for a candidate that does not exist, so
+  // an attempt that has not even started after three seconds is a miss. One
+  // that started (a slow first run at login) gets up to half a minute more.
+  Timer {
+    id: pythonProbeWatchdog
+    interval: 3000
+    repeat: false
+    onTriggered: {
+      var probe = root._pythonProbeObject
+      if (probe && probe.started && ++root._pythonProbeWaits < 10) { restart(); return }
+      root.settlePythonProbe(root._pythonAttempt, false, -1)
+      if (probe) { probe.running = false; probe.destroy() }
+    }
+  }
+
+  // Detached launches the user clicks for: the Spotify app, Omarchy's
+  // launch-or-focus and floating-terminal scripts. The command is an
+  // absolute argv; the environment is cleared down to the session handles a
+  // GUI program needs with PATH pinned, so no BASH_ENV, exported shell
+  // function or user PATH entry reaches those scripts.
+  Process {
+    id: detachedLauncher
+    running: false
+    command: []
+    clearEnvironment: true
+    environment: root.launchEnvironment
+  }
+
+  function launchDetached(command, missing) {
+    if (!command || command.length === 0) {
+      flash(missing, true)
+      return false
+    }
+    detachedLauncher.command = command
+    detachedLauncher.startDetached()
+    return true
+  }
+
+  function focusApp() {
+    return launchDetached(Model.focusAppCommand(tools), "omarchy-launch-or-focus was not found in Omarchy's directories")
+  }
+
+  function launchInstall() {
+    return launchDetached(Model.installLaunchCommand(tools), "Omarchy's floating terminal launcher was not found")
   }
 
   // Common failure handling: auth-shaped errors flip the connection state so
@@ -232,6 +394,8 @@ Item {
       root.authenticated = d.authenticated === true
       root.appInstalled = d.appInstalled === true
       root.appRunning = d.appRunning === true
+      root.appBinary = d.appBinary || ""
+      root.tools = d.tools || {}
       root.daemonInstalled = d.daemonInstalled === true
       root.daemonPath = d.daemonPath || ""
       root.daemonUnit = d.daemonUnit === true
@@ -553,7 +717,8 @@ Item {
   function launchApp() {
     if (!shell) return
     // uwsm-app keeps the client in its own scope, matching omarchy's installer.
-    Quickshell.execDetached(["bash", "-lc", "setsid uwsm-app -- spotify >/dev/null 2>&1 &"])
+    if (!launchDetached(Model.appLaunchCommand(tools, appBinary),
+                        "uwsm-app or the Spotify app was not found in " + Model.trustedBinaryDirectories.join(", "))) return
     flash("Launching Spotify…", false)
     appLaunchTimer.restart()
   }
@@ -578,6 +743,8 @@ Item {
     legacyUpdater = d.legacyUpdater === true
     appInstalled = d.appInstalled === true
     appRunning = d.appRunning === true
+    if (d.appBinary !== undefined) appBinary = d.appBinary || ""
+    if (d.tools !== undefined) tools = d.tools || {}
   }
 
   function setUpSoloist() {

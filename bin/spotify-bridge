@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 """spotify-bridge — the Spotify Web API helper behind the Omarchy Spotify plugin.
 
 The QML side never talks HTTP itself. It runs this script with one subcommand
@@ -14,18 +14,29 @@ Auth is the PKCE flow (no client secret). Tokens live in
 $XDG_STATE_HOME/omarchy-spotify/auth.json (0600). Cover art is cached under
 $XDG_CACHE_HOME/omarchy-spotify/art so panel lists load from disk.
 
+Trust boundaries: the bridge runs under an isolated interpreter
+(`/usr/bin/python3 -I`) with a scrubbed environment; every program it starts
+is an absolute path from root-owned system directories with a rebuilt
+environment; every file it reads or writes is opened relative to a held,
+checked directory descriptor without following symlinks; and every HTTP body
+is read against a byte cap and an overall deadline.
+
 Only Python's standard library is used.
 """
 
 import argparse
 import base64
+import errno
 import hashlib
 import html
+import http.client as http_client
 import json
+import pwd
 import re
 import os
 import secrets
-import shutil
+import ssl
+import stat
 import subprocess
 import sys
 import threading
@@ -51,16 +62,22 @@ SCOPES = [
     "playlist-read-collaborative",
 ]
 
-HOME = os.path.expanduser("~")
-STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state"), "omarchy-spotify")
-CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "omarchy-spotify", "art")
-AUTH_PATH = os.path.join(STATE_DIR, "auth.json")
-LAST_PATH = os.path.join(STATE_DIR, "last-played.json")
-
 HTTP_TIMEOUT = 15
 ART_TIMEOUT = 8
 ART_WORKERS = 8
 ART_MAX_BYTES = 8 * 1024 * 1024
+# Every Web API and token reply is JSON far below this. A larger body is
+# refused before it is decoded or parsed.
+API_MAX_BYTES = 2 * 1024 * 1024
+ERROR_MAX_BYTES = 64 * 1024
+# Cover art is only ever fetched from Spotify's own image CDNs.
+ART_HOST_RE = re.compile(r"^(?:[a-z0-9-]+\.)*(?:scdn\.co|spotifycdn\.com)$")
+ART_NAME_RE = re.compile(r"^[0-9a-f]{28}\.jpg$")
+
+AUTH_MAX_BYTES = 64 * 1024
+LAST_MAX_BYTES = 16 * 1024
+SOLOIST_ENV_MAX_BYTES = 16 * 1024
+UNIT_MAX_BYTES = 64 * 1024
 
 SPOTIFY_ID_RE = re.compile(r"^[A-Za-z0-9]{1,64}$")
 SPOTIFY_URI_RE = re.compile(r"^spotify:[a-z_]+:[A-Za-z0-9:_-]{1,128}$")
@@ -108,40 +125,454 @@ class ApiError(Exception):
         self.retry_after = retry_after
 
 
-# ---------------------------------------------------------------- auth store
+# --------------------------------------------------------------- environment
+#
+# Nothing the bridge starts is looked up through the session PATH, and nothing
+# it starts sees the session's environment. Programs come from a fixed list of
+# root-owned system directories, and each child gets a rebuilt environment
+# holding only what that child needs.
 
-def load_auth():
+# /usr/local/bin and anything under $HOME are deliberately absent: those are
+# the usual landing spots for a shadow binary.
+TRUSTED_BIN_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin", "/run/current-system/sw/bin")
+# Omarchy's own launchers ship in its tree; the system directories still win.
+TRUSTED_OMARCHY_DIRS = TRUSTED_BIN_DIRS + ("/usr/share/omarchy/bin", "/usr/local/share/omarchy/bin")
+TRUSTED_PATH = ":".join(TRUSTED_BIN_DIRS)
+# A browser launch goes through Omarchy scripts that name their own helpers.
+TRUSTED_SESSION_PATH = ":".join(TRUSTED_BIN_DIRS + ("/usr/share/omarchy/bin",))
+
+# Directory variables, honoured only as clean absolute paths.
+PATH_ENV_NAMES = ("HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME",
+                  "XDG_DATA_HOME", "XDG_RUNTIME_DIR")
+# What `systemctl --user` needs to reach the user manager.
+BUS_ENV_NAMES = ("USER", "LOGNAME", "DBUS_SESSION_BUS_ADDRESS")
+# What opening the login page in a browser needs to reach the graphical session.
+DISPLAY_ENV_NAMES = ("LANG", "WAYLAND_DISPLAY", "DISPLAY", "XDG_CURRENT_DESKTOP",
+                     "XDG_SESSION_TYPE", "XDG_SESSION_DESKTOP", "HYPRLAND_INSTANCE_SIGNATURE")
+ALLOWED_ENV_NAMES = PATH_ENV_NAMES + BUS_ENV_NAMES + DISPLAY_ENV_NAMES
+TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def clean_env_value(name, value):
+    """`value` when it is a bounded single-line string (and, for a directory
+    variable, a normalized absolute path); "" for anything else."""
+    if not isinstance(value, str) or not value or len(value) > 4096 or CONTROL_RE.search(value):
+        return ""
+    if name in PATH_ENV_NAMES:
+        if not value.startswith("/") or value.startswith("//") or os.path.normpath(value) != value:
+            return ""
+    return value
+
+
+def scrub_environment():
+    """Replace the inherited environment with the allow-listed variables and a
+    fixed PATH before anything consults it — urllib's proxy lookup, ssl's
+    SSL_CERT_FILE, subprocess resolution. The interpreter itself already runs
+    with -I, so PYTHON* variables and user site-packages never applied."""
+    kept = {}
+    for name in ALLOWED_ENV_NAMES:
+        value = clean_env_value(name, os.environ.get(name))
+        if value:
+            kept[name] = value
+    os.environ.clear()
+    os.environ.update(kept)
+    os.environ["PATH"] = TRUSTED_PATH
+
+
+def child_env(display=False):
+    """The complete environment for a child process: the fixed PATH, the
+    directory and session-bus variables, and — only for a browser launch —
+    what reaches the display. Nothing else (LD_PRELOAD, BASH_ENV, exported
+    shell functions, proxies) is carried over."""
+    env = {"PATH": TRUSTED_SESSION_PATH if display else TRUSTED_PATH}
+    for name in PATH_ENV_NAMES + BUS_ENV_NAMES + (DISPLAY_ENV_NAMES if display else ()):
+        value = clean_env_value(name, os.environ.get(name))
+        if value:
+            env[name] = value
+    if not display:
+        env["LC_ALL"] = "C"
+    return env
+
+
+def home():
+    return clean_env_value("HOME", os.environ.get("HOME")) or pwd.getpwuid(os.geteuid()).pw_dir
+
+
+def xdg_home(name, *fallback):
+    return clean_env_value(name, os.environ.get(name)) or os.path.join(home(), *fallback)
+
+
+def safe_chain(path, owners):
+    """True when every component of the absolute, symlink-free `path`, from /
+    down to and including its last one, exists, is owned by one of `owners`,
+    and is writable by nobody else. A root-owned sticky directory (/tmp,
+    /nix/store) is allowed along the way: nobody but an entry's owner can
+    rename or remove what is in it."""
+    parts = path.split("/")
+    for i in range(1, len(parts) + 1):
+        prefix = "/".join(parts[:i]) or "/"
+        try:
+            st = os.lstat(prefix)
+        except OSError:
+            return False
+        if stat.S_ISLNK(st.st_mode) or st.st_uid not in owners:
+            return False
+        if st.st_mode & 0o022 and not (st.st_uid == 0 and stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_ISVTX):
+            return False
+    return True
+
+
+def trusted_tool(name, dirs=TRUSTED_BIN_DIRS):
+    """Absolute path of `name` in the first trusted directory holding it, or ""
+    — never a PATH lookup. The file it resolves to, and every directory on the
+    way to it, must be root-owned and writable by nobody else."""
+    if not TOOL_NAME_RE.match(name or ""):
+        return ""
+    for directory in dirs:
+        candidate = directory + "/" + name
+        try:
+            st = os.stat(candidate)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode) or not st.st_mode & 0o111:
+            continue
+        if safe_chain(os.path.realpath(directory), (0,)) and safe_chain(os.path.realpath(candidate), (0,)):
+            return candidate
+    return ""
+
+
+def user_executable(path):
+    """True for a regular executable owned by root or by this user, reached
+    only through directories nobody else can write to — both where `path`
+    sits and wherever a symlink there leads."""
+    owners = (0, os.geteuid())
     try:
-        with open(AUTH_PATH, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+        st = os.stat(path)
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode) or not st.st_mode & 0o111:
+        return False
+    return (safe_chain(os.path.realpath(os.path.dirname(path)), owners)
+            and safe_chain(os.path.realpath(path), owners))
 
 
-def save_auth(auth):
-    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
-    tmp = AUTH_PATH + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(auth, fh)
-    os.replace(tmp, AUTH_PATH)
+# ------------------------------------------------------------ private files
+#
+# Every file the bridge touches lives below a directory it holds open by
+# descriptor, and every operation on it is relative to that descriptor, so a
+# pathname swapped afterwards cannot redirect a read or a write.
+
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOCTTY
+CREATE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+MAX_SYMLINK_HOPS = 16
+ENTRY_NAME_RE = re.compile(r"^(?!\.\.?$)[A-Za-z0-9._-]{1,128}$")
 
 
-def clear_auth():
+class UnsafePath(ApiError):
+    def __init__(self, message):
+        super().__init__("unsafe_path", message)
+
+
+class HeldDir:
+    """A directory held open by descriptor; `path` is only for messages and for
+    telling the panel where cover art landed."""
+
+    def __init__(self, fd, path):
+        self.fd = fd
+        self.path = path
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def close(self):
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+    def entry(self, name):
+        return self.path.rstrip("/") + "/" + name
+
+
+def _check_dir(st, where):
+    if not stat.S_ISDIR(st.st_mode):
+        raise UnsafePath("%s is not a directory" % where)
+    if st.st_uid not in (0, os.geteuid()):
+        raise UnsafePath("%s is owned by another user" % where)
+    if st.st_mode & 0o022 and not (st.st_uid == 0 and st.st_mode & stat.S_ISVTX):
+        raise UnsafePath("%s is writable by other users" % where)
+
+
+def _open_child(parent_fd, name, where, create):
+    """Open one directory component below `parent_fd` without following a
+    symlink. Returns (fd, None), or (None, target) when the entry is a symlink,
+    so the caller decides whether one is acceptable there."""
     try:
-        os.remove(AUTH_PATH)
+        st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        if not create:
+            raise
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if stat.S_ISLNK(st.st_mode):
+        if st.st_uid not in (0, os.geteuid()):
+            raise UnsafePath("%s is a symbolic link owned by another user" % where)
+        return None, os.readlink(name, dir_fd=parent_fd)
+    try:
+        fd = os.open(name, DIR_FLAGS, dir_fd=parent_fd)
+    except OSError as err:
+        if err.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise UnsafePath("%s changed while it was being opened" % where)
+        raise
+    try:
+        held = os.fstat(fd)
+        if (held.st_dev, held.st_ino) != (st.st_dev, st.st_ino):
+            raise UnsafePath("%s changed while it was being opened" % where)
+        _check_dir(held, where)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, None
+
+
+def open_dir(base, owned=(), create=False):
+    """Hold `base`/`owned...` open and return it as a HeldDir.
+
+    `base` (an XDG directory, or one below it) is walked from / one component
+    at a time. Each directory must be owned by root or by you and writable by
+    nobody else. A symlink along `base` is followed only if it is yours or
+    root's, and then everything it leads through passes the same checks — so a
+    dotfile manager's symlinked ~/.config keeps working while a link into
+    someone else's directory does not.
+
+    The `owned` components below it belong to this plugin: each must be a real
+    directory (never a symlink) owned by you, and is tightened to 0700 when
+    `create` is set. Missing components are created 0700 only with `create`;
+    otherwise FileNotFoundError propagates."""
+    if not isinstance(base, str) or not base.startswith("/") or "\x00" in base:
+        raise UnsafePath("Not an absolute directory: %r" % (base,))
+    stack = [os.open("/", DIR_FLAGS)]
+    names = []
+    try:
+        _check_dir(os.fstat(stack[0]), "/")
+        pending = [part for part in reversed(base.split("/")) if part]
+        hops = 0
+        while pending:
+            name = pending.pop()
+            if name == ".":
+                continue
+            if name == "..":
+                if len(stack) > 1:
+                    os.close(stack.pop())
+                    names.pop()
+                continue
+            where = "/" + "/".join(names + [name])
+            fd, target = _open_child(stack[-1], name, where, create)
+            if target is not None:
+                hops += 1
+                if hops > MAX_SYMLINK_HOPS:
+                    raise UnsafePath("Too many symbolic links under %s" % base)
+                if target.startswith("/"):
+                    while len(stack) > 1:
+                        os.close(stack.pop())
+                    names = []
+                pending.extend(part for part in reversed(target.split("/")) if part)
+                continue
+            stack.append(fd)
+            names.append(name)
+        for name in owned:
+            if not ENTRY_NAME_RE.match(name):
+                raise UnsafePath("Bad directory name: %r" % (name,))
+            where = "/" + "/".join(names + [name])
+            fd, target = _open_child(stack[-1], name, where, create)
+            if target is not None:
+                raise UnsafePath("%s is a symbolic link" % where)
+            stack.append(fd)
+            names.append(name)
+            st = os.fstat(fd)
+            if st.st_uid != os.geteuid():
+                raise UnsafePath("%s is not owned by you" % where)
+            if create and st.st_mode & 0o077:
+                os.fchmod(fd, 0o700)
+        return HeldDir(stack.pop(), "/" + "/".join(names))
+    finally:
+        for fd in stack:
+            os.close(fd)
+
+
+def read_file_at(held, name, limit, private):
+    """The bytes of regular file `name` below `held`, or None when there is no
+    such entry. Refused with UnsafePath: a symlink (O_NOFOLLOW), a FIFO, socket
+    or device (opened non-blocking so it cannot hang, then rejected by type), a
+    file owned by someone else or with a second hard link, one others can write
+    — or, when `private`, read — and anything larger than `limit` bytes, which
+    is never read past limit + 1."""
+    where = held.entry(name)
+    if not ENTRY_NAME_RE.match(name):
+        raise UnsafePath("Bad file name: %r" % (name,))
+    try:
+        fd = os.open(name, READ_FLAGS, dir_fd=held.fd)
+    except FileNotFoundError:
+        return None
+    except OSError as err:
+        if err.errno == errno.ELOOP:
+            raise UnsafePath("%s is a symbolic link" % where)
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise UnsafePath("%s is not a regular file" % where)
+        if st.st_uid != os.geteuid():
+            raise UnsafePath("%s is not owned by you" % where)
+        if st.st_nlink != 1:
+            raise UnsafePath("%s has more than one hard link" % where)
+        if st.st_mode & (0o077 if private else 0o022):
+            raise UnsafePath("%s is open to other users (mode %o) — chmod 600 it"
+                             % (where, stat.S_IMODE(st.st_mode)))
+        if st.st_size > limit:
+            raise UnsafePath("%s is larger than %d bytes" % (where, limit))
+        chunks = []
+        total = 0
+        while total <= limit:
+            chunk = os.read(fd, min(65536, limit + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > limit:
+            raise UnsafePath("%s is larger than %d bytes" % (where, limit))
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def write_file_at(held, name, data, mode=0o600):
+    """Atomically replace `name` below `held` with `data`.
+
+    The content goes into a fresh, unpredictably named temp file created with
+    O_CREAT|O_EXCL|O_NOFOLLOW at 0600 — so nothing planted in advance can be
+    written through — then fsynced and renamed over `name` within the same held
+    directory. rename(2) replaces a directory entry and never follows one. An
+    existing `name` that is not a regular file you own (a symlink, a FIFO,
+    someone else's file) is refused rather than replaced. The temp file is
+    removed on any failure."""
+    where = held.entry(name)
+    if not ENTRY_NAME_RE.match(name):
+        raise UnsafePath("Bad file name: %r" % (name,))
+    try:
+        st = os.stat(name, dir_fd=held.fd, follow_symlinks=False)
+    except FileNotFoundError:
+        st = None
+    if st is not None and (not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid()):
+        raise UnsafePath("Refusing to replace %s: it is not a regular file you own" % where)
+    tmp = ".%s.%s.tmp" % (name, secrets.token_hex(12))
+    fd = os.open(tmp, CREATE_FLAGS, 0o600, dir_fd=held.fd)
+    try:
+        try:
+            os.fchmod(fd, mode)
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.rename(tmp, name, src_dir_fd=held.fd, dst_dir_fd=held.fd)
+    except BaseException:
+        try:
+            os.unlink(tmp, dir_fd=held.fd)
+        except OSError:
+            pass
+        raise
+    try:
+        os.fsync(held.fd)
     except OSError:
         pass
 
 
-def load_last():
+def unlink_at(held, name):
+    """Remove the entry itself (a symlink is removed, never followed)."""
     try:
-        with open(LAST_PATH, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
+        os.unlink(name, dir_fd=held.fd)
+        return True
+    except OSError:
+        return False
+
+
+def lexists_at(held, name):
+    try:
+        os.stat(name, dir_fd=held.fd, follow_symlinks=False)
+        return True
+    except OSError:
+        return False
+
+
+# ---------------------------------------------------------------- auth store
+
+def state_dir(create=False):
+    return open_dir(xdg_home("XDG_STATE_HOME", ".local", "state"), ("omarchy-spotify",), create)
+
+
+def load_json_at(held, name, limit, private):
+    blob = read_file_at(held, name, limit, private)
+    if not blob:
         return {}
+    try:
+        data = json.loads(blob.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def load_auth():
+    """The stored login, or {} when there is none. An auth.json that is a
+    symlink, not yours, open to other users, hard-linked or oversized raises
+    UnsafePath: it is neither read nor silently treated as signed out."""
+    try:
+        with state_dir() as held:
+            return load_json_at(held, "auth.json", AUTH_MAX_BYTES, private=True)
+    except FileNotFoundError:
+        return {}
+
+
+def save_auth(auth):
+    blob = json.dumps(auth).encode("utf-8")
+    with state_dir(create=True) as held:
+        write_file_at(held, "auth.json", blob, 0o600)
+        # The fixed temp name earlier versions wrote through; never used again.
+        unlink_at(held, "auth.json.tmp")
+
+
+def clear_auth():
+    try:
+        with state_dir() as held:
+            unlink_at(held, "auth.json")
+            unlink_at(held, "auth.json.tmp")
+    except FileNotFoundError:
+        pass
+
+
+def load_last():
+    """The remembered last item, only if its artPath is a cover this bridge
+    cached: the panel loads that path as an image."""
+    try:
+        with state_dir() as held:
+            data = load_json_at(held, "last-played.json", LAST_MAX_BYTES, private=False)
+        with open_dir(xdg_home("XDG_CACHE_HOME", ".cache"), ("omarchy-spotify", "art")) as art:
+            art_root = art.path
+    except (OSError, ApiError):
+        return {}
+    art_path = data.get("artPath")
+    if (not isinstance(art_path, str) or os.path.dirname(art_path) != art_root
+            or not ART_NAME_RE.match(os.path.basename(art_path))):
+        return {}
+    return {key: str(data.get(key) or "")[:2048] for key in ("uri", "name", "subtitle", "art", "artPath")}
 
 
 def remember_last(item):
@@ -152,15 +583,14 @@ def remember_last(item):
     previous = load_last()
     if previous.get("uri") == item.get("uri") and previous.get("artPath") == item.get("artPath"):
         return
-    try:
-        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
-        tmp = LAST_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump({"uri": item.get("uri", ""), "name": item.get("name", ""),
+    blob = json.dumps({"uri": item.get("uri", ""), "name": item.get("name", ""),
                        "subtitle": item.get("artists") or item.get("show") or item.get("book") or "",
-                       "art": item.get("art", ""), "artPath": item["artPath"]}, fh)
-        os.replace(tmp, LAST_PATH)
-    except OSError:
+                       "art": item.get("art", ""), "artPath": item["artPath"]}).encode("utf-8")
+    try:
+        with state_dir(create=True) as held:
+            write_file_at(held, "last-played.json", blob, 0o600)
+            unlink_at(held, "last-played.json.tmp")
+    except (OSError, ApiError):
         pass
 
 
@@ -173,22 +603,110 @@ def mask(value):
 
 # ------------------------------------------------------------------ http core
 
-def http(method, url, headers=None, data=None, timeout=HTTP_TIMEOUT):
-    """Return (status, body_text, headers). Never raises for HTTP status codes."""
+class ResponseTooLarge(ApiError):
+    def __init__(self, limit):
+        super().__init__("too_large", "Spotify sent a reply larger than %d bytes; it was refused" % limit)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect. The Web API, the token endpoint and the image
+    CDN all answer directly; following one would copy the bearer token onto the
+    new request and read the redirect body without a limit."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def build_opener(allow_plain_http=False):
+    """An opener with HTTPS and nothing else: no proxies taken from the
+    environment, no redirects, no file:, ftp: or data: handlers."""
+    opener = urllib.request.OpenerDirector()
+    handlers = [
+        urllib.request.UnknownHandler(),
+        urllib.request.HTTPDefaultErrorHandler(),
+        NoRedirect(),
+        urllib.request.HTTPErrorProcessor(),
+        urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+    ]
+    if allow_plain_http:  # the test suite's local server only
+        handlers.append(urllib.request.HTTPHandler())
+    for handler in handlers:
+        opener.add_handler(handler)
+    return opener
+
+
+_OPENER = None
+_OPENER_LOCK = threading.Lock()
+
+
+def opener():
+    global _OPENER
+    with _OPENER_LOCK:
+        if _OPENER is None:
+            _OPENER = build_opener()
+        return _OPENER
+
+
+def read_bounded(stream, limit, headers=None, deadline=None):
+    """A whole HTTP body, but never more than `limit` bytes: refused up front
+    when Content-Length already exceeds it, otherwise read in chunks and
+    abandoned at the first byte past it. `deadline` (time.monotonic) bounds
+    the whole read, so a server trickling bytes under the socket timeout still
+    cannot hold the bridge open."""
+    length = headers.get("Content-Length") if headers is not None else None
+    if length is not None:
+        try:
+            declared = int(str(length).strip())
+        except ValueError:
+            declared = -1
+        if declared > limit:
+            raise ResponseTooLarge(limit)
+    read = getattr(stream, "read1", None) or stream.read
+    chunks = []
+    total = 0
+    while True:
+        if deadline is not None and time.monotonic() > deadline:
+            raise ApiError("network", "Spotify took too long to answer")
+        chunk = read(min(65536, limit + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > limit:
+            raise ResponseTooLarge(limit)
+    return b"".join(chunks)
+
+
+def http_raw(method, url, headers=None, data=None, timeout=HTTP_TIMEOUT, limit=API_MAX_BYTES):
+    """Return (status, body_bytes, headers). Never raises for HTTP status codes;
+    raises ApiError for transport failures and for any body — success or error
+    — over its cap."""
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("User-Agent", USER_AGENT)
     for key, value in (headers or {}).items():
         req.add_header(key, value)
+    deadline = time.monotonic() + 2 * timeout
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, resp.read().decode("utf-8", "replace"), dict(resp.headers)
+        with opener().open(req, timeout=timeout) as resp:
+            return resp.status, read_bounded(resp, limit, resp.headers, deadline), dict(resp.headers)
     except urllib.error.HTTPError as err:
-        body = err.read().decode("utf-8", "replace") if err.fp else ""
+        try:
+            body = read_bounded(err, min(limit, ERROR_MAX_BYTES), err.headers, deadline)
+        except (OSError, http_client.HTTPException):
+            body = b""
+        finally:
+            err.close()
         return err.code, body, dict(err.headers or {})
     except urllib.error.URLError as err:
         raise ApiError("network", "Spotify is unreachable: %s" % getattr(err, "reason", err))
-    except (TimeoutError, OSError) as err:
-        raise ApiError("network", "Spotify request timed out (%s)" % err)
+    except (TimeoutError, OSError, http_client.HTTPException) as err:
+        raise ApiError("network", "Spotify request failed (%s)" % err)
+
+
+def http(method, url, headers=None, data=None, timeout=HTTP_TIMEOUT, limit=API_MAX_BYTES):
+    """Return (status, body_text, headers); see http_raw."""
+    status, body, resp_headers = http_raw(method, url, headers, data, timeout, limit)
+    return status, body.decode("utf-8", "replace"), resp_headers
 
 
 def token_request(form):
@@ -336,29 +854,53 @@ def art_url(images, prefer):
     return candidates[-1]["url"]
 
 
-def art_path_for(url):
-    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:28]
-    return os.path.join(CACHE_DIR, digest + ".jpg")
+def art_url_allowed(url):
+    """HTTPS to Spotify's image CDNs on the default port, no credentials."""
+    try:
+        parts = urllib.parse.urlsplit(str(url or ""))
+        port = parts.port
+    except ValueError:
+        return False
+    return (parts.scheme == "https" and not parts.username and not parts.password
+            and port in (None, 443) and bool(ART_HOST_RE.match(parts.hostname or "")))
+
+
+_ART_DIR = None
+_ART_DIR_LOCK = threading.Lock()
+
+
+def art_dir():
+    """The cover cache, held open for the life of the process so the download
+    workers all write relative to one checked descriptor."""
+    global _ART_DIR
+    with _ART_DIR_LOCK:
+        if _ART_DIR is None:
+            _ART_DIR = open_dir(xdg_home("XDG_CACHE_HOME", ".cache"), ("omarchy-spotify", "art"), create=True)
+        return _ART_DIR
 
 
 def cache_one(url):
-    path = art_path_for(url)
-    if os.path.exists(path):
-        return path
-    if not url.startswith("https://"):
+    if not art_url_allowed(url):
         return ""
+    name = hashlib.sha1(url.encode("utf-8")).hexdigest()[:28] + ".jpg"
     try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=ART_TIMEOUT) as resp:
-            blob = resp.read(ART_MAX_BYTES + 1)
-        if len(blob) > ART_MAX_BYTES or not blob:
+        held = art_dir()
+        try:
+            st = os.stat(name, dir_fd=held.fd, follow_symlinks=False)
+        except FileNotFoundError:
+            st = None
+        if st is not None:
+            if (stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid() and st.st_nlink == 1
+                    and not st.st_mode & 0o022 and 0 < st.st_size <= ART_MAX_BYTES):
+                return held.entry(name)
+            # Anything else under that name — a symlink, a FIFO, somebody
+            # else's file — is taken out and the cover fetched again.
+            unlink_at(held, name)
+        status, blob, _ = http_raw("GET", url, timeout=ART_TIMEOUT, limit=ART_MAX_BYTES)
+        if status != 200 or not blob:
             return ""
-        tmp = path + ".%d.tmp" % os.getpid()
-        with open(tmp, "wb") as fh:
-            fh.write(blob)
-        os.replace(tmp, path)
-        return path
+        write_file_at(held, name, blob, 0o600)
+        return held.entry(name)
     except Exception:
         return ""
 
@@ -586,18 +1128,26 @@ def norm_device(d):
 
 # -------------------------------------------------------------- subcommands
 
-def quiet_ok(argv):
+def run_tool(argv, timeout=3):
+    """Run a resolved absolute command with the closed child environment.
+    Returns (returncode, stdout) and (1, "") when it cannot run at all."""
+    if not argv or not argv[0].startswith("/"):
+        return 1, ""
     try:
-        return subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3).returncode == 0
+        done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                              timeout=timeout, env=child_env())
+        return done.returncode, done.stdout.strip()[:4096]
     except Exception:
-        return False
+        return 1, ""
 
 
-SOLOIST_ENV = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "soloist", "soloist.env")
+def quiet_ok(argv):
+    return run_tool(argv)[0] == 0
+
+
+SOLOIST_ENV_NAME = "soloist.env"
 SOLOIST_UNIT = "soloist"
 SOLOIST_SERVICE = "soloist.service"
-SYSTEMD_USER_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "systemd", "user")
-OUR_UNIT = os.path.join(SYSTEMD_USER_DIR, SOLOIST_SERVICE)
 # Stamped into the unit file this plugin writes, so "Remove Soloist" only ever
 # deletes a unit this plugin created and never one from a package.
 UNIT_MARKER = "# Managed by the ninepointlabs.spotify Omarchy plugin"
@@ -612,47 +1162,107 @@ LEGACY_UNIT_FINGERPRINT = (
 # That path is gone; these names survive only so the plugin can take the units
 # back off machines that still have them. Nothing re-creates them.
 LEGACY_UPDATE_UNITS = ["soloist-update.service", "soloist-update.timer"]
-LEGACY_UPDATER = os.path.join(HOME, ".local", "bin", "soloist-update")
+LEGACY_UPDATER_NAME = "soloist-update"
 
 SOLOIST_MISSING_HINT = (
     "No soloist binary found. Install Spotify Soloist yourself first, then click Set up "
     "again: on Arch/Omarchy the AUR package spotify-soloist-bin, otherwise the download "
-    "linked from https://developer.spotify.com/documentation/soloist. This plugin "
-    "deliberately does not fetch it — Spotify publishes no checksum and no signature "
-    "for those builds, so a download could not be verified against anything."
+    "linked from https://developer.spotify.com/documentation/soloist, unpacked into "
+    "~/.local/bin. This plugin deliberately does not fetch it — Spotify publishes no "
+    "checksum and no signature for those builds, so a download could not be verified "
+    "against anything."
 )
+
+
+def config_home():
+    return xdg_home("XDG_CONFIG_HOME", ".config")
+
+
+def systemd_user_dir(create=False):
+    return open_dir(os.path.join(config_home(), "systemd", "user"), (), create)
+
+
+def soloist_config_dir(create=False):
+    return open_dir(config_home(), ("soloist",), create)
+
+
+def user_bin_dir():
+    return open_dir(os.path.join(home(), ".local", "bin"))
+
+
+def read_our_unit():
+    """Text of ~/.config/systemd/user/soloist.service, or None when it is
+    absent or is not a plain file you own (a symlink into a package's unit is
+    never read as, or treated as, ours)."""
+    try:
+        with systemd_user_dir() as held:
+            blob = read_file_at(held, SOLOIST_SERVICE, UNIT_MAX_BYTES, private=False)
+    except (OSError, ApiError):
+        return None
+    return None if blob is None else blob.decode("utf-8", "replace")
+
+
+def our_unit_exists():
+    try:
+        with systemd_user_dir() as held:
+            return lexists_at(held, SOLOIST_SERVICE)
+    except (OSError, ApiError):
+        return False
 
 
 def unit_is_ours():
     """True when ~/.config/systemd/user/soloist.service is a file this plugin
     wrote. A unit from a package (which lives under /usr) or one the user wrote
     by hand is never ours to rewrite or delete."""
-    try:
-        with open(OUR_UNIT, "r", encoding="utf-8") as fh:
-            body = fh.read()
-    except OSError:
-        return False
-    return UNIT_MARKER in body or all(line in body for line in LEGACY_UNIT_FINGERPRINT)
+    body = read_our_unit()
+    return body is not None and (UNIT_MARKER in body or all(line in body for line in LEGACY_UNIT_FINGERPRINT))
 
 
 def find_soloist():
-    """Locate a soloist binary the user installed themselves — a distro
-    package, or their own unpacked copy in ~/.local/bin. The plugin only ever
-    reads this; it never downloads, installs or replaces the binary."""
-    path = shutil.which("soloist")
-    if not path:
-        local = os.path.join(HOME, ".local", "bin", "soloist")
-        if os.path.isfile(local) and os.access(local, os.X_OK):
-            path = local
-    return path or ""
+    """Locate a soloist binary the user installed themselves: a package in a
+    trusted system directory first, then an unpacked copy in ~/.local/bin. That
+    copy is accepted only as a regular executable owned by you (or root), with
+    nobody else able to write to it or to any directory leading to it —
+    wherever a symlink there points. The session PATH is never searched. The
+    plugin only ever reads this; it never downloads, installs or replaces the
+    binary."""
+    path = trusted_tool("soloist")
+    if path:
+        return path
+    local = os.path.join(home(), ".local", "bin", "soloist")
+    return local if user_executable(local) else ""
 
 
 def systemctl_user(*args):
-    try:
-        done = subprocess.run(["systemctl", "--user"] + list(args), capture_output=True, text=True, timeout=3)
-        return done.returncode, done.stdout.strip()
-    except Exception:
+    tool = trusted_tool("systemctl")
+    if not tool:
         return 1, ""
+    return run_tool([tool, "--user"] + list(args))
+
+
+def read_soloist_env():
+    """Lines of ~/.config/soloist/soloist.env, or None when it does not exist.
+    It holds the API key, so it must be a private (0600) regular file you own."""
+    try:
+        with soloist_config_dir() as held:
+            blob = read_file_at(held, SOLOIST_ENV_NAME, SOLOIST_ENV_MAX_BYTES, private=True)
+    except FileNotFoundError:
+        return None
+    return None if blob is None else blob.decode("utf-8", "replace").splitlines()
+
+
+def legacy_updater_present():
+    try:
+        with systemd_user_dir() as held:
+            if any(lexists_at(held, unit) for unit in LEGACY_UPDATE_UNITS):
+                return True
+    except (OSError, ApiError):
+        pass
+    try:
+        with user_bin_dir() as held:
+            return lexists_at(held, LEGACY_UPDATER_NAME)
+    except (OSError, ApiError):
+        return False
 
 
 def soloist_state():
@@ -662,58 +1272,71 @@ def soloist_state():
     binary; this plugin only finds it and wires a systemd *user* service
     around it."""
     binary = find_soloist()
-    configured = False
-    if os.path.exists(SOLOIST_ENV):
-        try:
-            with open(SOLOIST_ENV, "r", encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if line.startswith("SOLOIST_API_KEY=") and line.split("=", 1)[1].strip().strip('"\'') != "":
-                        configured = True
-        except OSError:
-            configured = False
+    env_problem = ""
+    try:
+        lines = read_soloist_env() or []
+    except (OSError, ApiError) as err:
+        lines = []
+        env_problem = getattr(err, "message", "") or str(err)
+    configured = any(line.strip().startswith("SOLOIST_API_KEY=")
+                     and line.strip().split("=", 1)[1].strip().strip('"\'') != "" for line in lines)
     # A unit may come from this plugin (~/.config/systemd/user) or from a
     # package the user installed. Only the first kind is ours to delete.
     unit_path = systemctl_user("show", "-p", "FragmentPath", "--value", SOLOIST_SERVICE)[1]
+    unit_exists = bool(unit_path) or our_unit_exists()
     managed = unit_is_ours()
     running = bool(binary) and systemctl_user("is-active", "--quiet", SOLOIST_UNIT)[0] == 0
     _, exit_status = systemctl_user("show", "-p", "ExecMainStatus", "--value", SOLOIST_UNIT)
     expired = bool(binary) and not running and exit_status == "10"
-    data_dir = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share"), "soloist")
     paired = False
     try:
-        paired = any(not name.startswith("ws.") for name in os.listdir(data_dir))
-    except OSError:
+        with open_dir(os.path.join(xdg_home("XDG_DATA_HOME", ".local", "share"), "soloist")) as held:
+            paired = any(not name.startswith("ws.") for name in os.listdir(held.fd))
+    except (OSError, ApiError):
         paired = False
-    legacy = os.path.exists(LEGACY_UPDATER) or any(
-        os.path.exists(os.path.join(SYSTEMD_USER_DIR, unit)) for unit in LEGACY_UPDATE_UNITS)
     return {
         "daemonName": "Soloist",
         "daemonInstalled": bool(binary),
         "daemonPath": binary,
-        "daemonUnit": bool(unit_path) or os.path.exists(OUR_UNIT),
+        "daemonUnit": unit_exists,
         "daemonManaged": managed,
-        "daemonForeignUnit": (bool(unit_path) or os.path.exists(OUR_UNIT)) and not managed,
+        "daemonForeignUnit": unit_exists and not managed,
         "daemonConfigured": configured,
+        "daemonEnvProblem": env_problem,
         "daemonRunning": running,
         "daemonExpired": expired,
         "daemonPaired": paired,
         # True while a machine still carries the weekly re-download timer an
         # earlier version of this plugin installed, so the panel can offer to
         # take it off.
-        "legacyUpdater": legacy,
+        "legacyUpdater": legacy_updater_present(),
+    }
+
+
+def launch_tools():
+    """Absolute paths the panel starts detached programs through (the app
+    launcher, Omarchy's focus and floating-terminal scripts). Resolved here
+    from the trusted directories only; Model.js validates them again before
+    any of them is used as a command."""
+    return {
+        "uwsm-app": trusted_tool("uwsm-app"),
+        "omarchy-launch-or-focus": trusted_tool("omarchy-launch-or-focus", TRUSTED_OMARCHY_DIRS),
+        "omarchy-launch-floating-terminal-with-presentation":
+            trusted_tool("omarchy-launch-floating-terminal-with-presentation", TRUSTED_OMARCHY_DIRS),
     }
 
 
 def app_state():
     """The desktop app and the headless Soloist daemon are the two local
     Spotify Connect devices the panel knows how to start."""
-    binary = shutil.which("spotify") or shutil.which("spotify-launcher") or ""
-    running = bool(binary) and quiet_ok(["pgrep", "-x", "spotify"])
+    binary = trusted_tool("spotify") or trusted_tool("spotify-launcher")
+    pgrep = trusted_tool("pgrep")
+    running = bool(binary) and bool(pgrep) and quiet_ok([pgrep, "-x", "spotify"])
     state = {
         "appBinary": binary,
         "appInstalled": bool(binary),
         "appRunning": running,
+        "tools": launch_tools(),
     }
     state.update(soloist_state())
     return state
@@ -756,33 +1379,31 @@ def write_soloist_env(key=None, device_name=None):
         raise ApiError("bad_args", "That doesn't look like a Soloist API key")
     if device_name is not None:
         device_name = '"%s"' % clean_device_name(device_name)
-    lines = []
-    if os.path.exists(SOLOIST_ENV):
-        with open(SOLOIST_ENV, "r", encoding="utf-8") as fh:
-            lines = fh.read().splitlines()
-    else:
-        lines = [
-            "# Spotify Soloist — read by ~/.config/systemd/user/soloist.service",
-            "# SOLOIST_API_KEY comes from https://developer.spotify.com/dashboard →",
-            "# \"Spotify Soloist API Key\". It is tied to your account; keep this file private.",
-            "SOLOIST_API_KEY=",
-            "SOLOIST_DEVICE_NAME=Omarchy",
-        ]
-    def put(name, value):
-        for i, line in enumerate(lines):
-            if line.startswith(name + "="):
-                lines[i] = "%s=%s" % (name, value)
-                return
-        lines.append("%s=%s" % (name, value))
-    if key is not None:
-        put("SOLOIST_API_KEY", key)
-    if device_name is not None:
-        put("SOLOIST_DEVICE_NAME", device_name)
-    os.makedirs(os.path.dirname(SOLOIST_ENV), mode=0o700, exist_ok=True)
-    fd = os.open(SOLOIST_ENV + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(lines) + "\n")
-    os.replace(SOLOIST_ENV + ".tmp", SOLOIST_ENV)
+    with soloist_config_dir(create=True) as held:
+        blob = read_file_at(held, SOLOIST_ENV_NAME, SOLOIST_ENV_MAX_BYTES, private=True)
+        if blob is not None:
+            lines = blob.decode("utf-8", "replace").splitlines()
+        else:
+            lines = [
+                "# Spotify Soloist — read by ~/.config/systemd/user/soloist.service",
+                "# SOLOIST_API_KEY comes from https://developer.spotify.com/dashboard →",
+                "# \"Spotify Soloist API Key\". It is tied to your account; keep this file private.",
+                "SOLOIST_API_KEY=",
+                "SOLOIST_DEVICE_NAME=Omarchy",
+            ]
+
+        def put(name, value):
+            for i, line in enumerate(lines):
+                if line.startswith(name + "="):
+                    lines[i] = "%s=%s" % (name, value)
+                    return
+            lines.append("%s=%s" % (name, value))
+        if key is not None:
+            put("SOLOIST_API_KEY", key)
+        if device_name is not None:
+            put("SOLOIST_DEVICE_NAME", device_name)
+        write_file_at(held, SOLOIST_ENV_NAME, ("\n".join(lines) + "\n").encode("utf-8"), 0o600)
+        unlink_at(held, SOLOIST_ENV_NAME + ".tmp")
 
 
 def write_soloist_unit(binary):
@@ -793,23 +1414,26 @@ def write_soloist_unit(binary):
         raise ApiError("bad_binary", "Refusing to write a unit for this soloist path")
     template = os.path.join(PLUGIN_DIR, "contrib", "systemd", SOLOIST_SERVICE)
     try:
-        with open(template, "r", encoding="utf-8") as fh:
-            body = fh.read()
+        with open(template, "rb") as fh:
+            raw = fh.read(UNIT_MAX_BYTES + 1)
     except OSError as err:
         raise ApiError("no_template", "Could not read contrib/systemd/%s: %s" % (SOLOIST_SERVICE, err))
+    if len(raw) > UNIT_MAX_BYTES:
+        raise ApiError("no_template", "contrib/systemd/%s is unexpectedly large" % SOLOIST_SERVICE)
+    body = raw.decode("utf-8", "replace")
     if "@SOLOIST_BIN@" not in body:
         raise ApiError("no_template", "contrib/systemd/%s has no @SOLOIST_BIN@ placeholder" % SOLOIST_SERVICE)
-    os.makedirs(SYSTEMD_USER_DIR, exist_ok=True)
-    with open(OUR_UNIT + ".tmp", "w", encoding="utf-8") as fh:
-        fh.write(UNIT_MARKER + "\n" + body.replace("@SOLOIST_BIN@", binary))
-    os.replace(OUR_UNIT + ".tmp", OUR_UNIT)
+    rendered = UNIT_MARKER + "\n" + body.replace("@SOLOIST_BIN@", binary)
+    with systemd_user_dir(create=True) as held:
+        write_file_at(held, SOLOIST_SERVICE, rendered.encode("utf-8"), 0o644)
+        unlink_at(held, SOLOIST_SERVICE + ".tmp")
 
 
-def remove_quietly(path):
+def remove_our_unit():
     try:
-        os.remove(path)
-        return True
-    except OSError:
+        with systemd_user_dir() as held:
+            return unlink_at(held, SOLOIST_SERVICE)
+    except (OSError, ApiError):
         return False
 
 
@@ -818,9 +1442,17 @@ def drop_legacy_updater():
     installed back off. Nothing in the plugin re-creates it."""
     systemctl_user("disable", "--now", "--quiet", "soloist-update.timer", "soloist-update.service")
     removed = False
-    for unit in LEGACY_UPDATE_UNITS:
-        removed = remove_quietly(os.path.join(SYSTEMD_USER_DIR, unit)) or removed
-    removed = remove_quietly(LEGACY_UPDATER) or removed
+    try:
+        with systemd_user_dir() as held:
+            for unit in LEGACY_UPDATE_UNITS:
+                removed = unlink_at(held, unit) or removed
+    except (OSError, ApiError):
+        pass
+    try:
+        with user_bin_dir() as held:
+            removed = unlink_at(held, LEGACY_UPDATER_NAME) or removed
+    except (OSError, ApiError):
+        pass
     if removed:
         systemctl_user("daemon-reload")
     return removed
@@ -847,7 +1479,7 @@ def cmd_soloist(args):
         # manage; shadowing it from ~/.config would be a surprise.
         if not state["daemonForeignUnit"]:
             write_soloist_unit(binary)
-        if not os.path.exists(SOLOIST_ENV):
+        if read_soloist_env() is None:
             write_soloist_env(device_name=args.device_name or "Omarchy")
         elif args.device_name:
             write_soloist_env(device_name=args.device_name)
@@ -857,7 +1489,7 @@ def cmd_soloist(args):
         key = (args.value or "").strip()
         if key == "-":
             # Read from stdin so the key never appears in a process list.
-            key = sys.stdin.readline().strip()
+            key = sys.stdin.readline(1024).strip()
         if not key:
             return fail("bad_args", "Paste the Soloist API key first")
         binary = find_soloist()
@@ -879,8 +1511,8 @@ def cmd_soloist(args):
         # leftovers of the old updater. The binary belongs to the user (or to
         # their package manager) and is never touched.
         systemctl_user("disable", "--now", "--quiet", SOLOIST_UNIT)
-        if soloist_state()["daemonManaged"]:
-            remove_quietly(OUR_UNIT)
+        if unit_is_ours():
+            remove_our_unit()
         drop_legacy_updater()
         systemctl_user("daemon-reload")
         out(app_state())
@@ -901,27 +1533,67 @@ def cmd_daemon(args):
     if not state["daemonUnit"]:
         return fail("no_unit", "No soloist.service yet — use Set up Soloist in the panel first", state)
     if not state["daemonConfigured"]:
-        return fail("daemon_unconfigured", "Add your Soloist API key to ~/.config/soloist/soloist.env first", state)
+        return fail("daemon_unconfigured", state["daemonEnvProblem"]
+                    or "Add your Soloist API key to ~/.config/soloist/soloist.env first", state)
     verb = args.action
-    if verb == "start":
-        ok = quiet_ok(["systemctl", "--user", "start", SOLOIST_UNIT])
-        if ok:
-            quiet_ok(["systemctl", "--user", "enable", "--quiet", SOLOIST_UNIT])
-    elif verb == "stop":
-        ok = quiet_ok(["systemctl", "--user", "stop", SOLOIST_UNIT])
-    elif verb == "restart":
-        ok = quiet_ok(["systemctl", "--user", "restart", SOLOIST_UNIT])
-    else:
+    if verb not in ("start", "stop", "restart"):
         return fail("bad_args", "daemon action must be start, stop, or restart")
+    ok = systemctl_user(verb, SOLOIST_UNIT)[0] == 0
+    if ok and verb == "start":
+        systemctl_user("enable", "--quiet", SOLOIST_UNIT)
     if not ok:
         return fail("daemon_failed", "systemctl --user %s soloist failed — check `journalctl --user -u soloist`" % verb)
     time.sleep(1.0)
     out(app_state())
 
 
+# The login listener reads at most this much of any request — request line and
+# headers together — and gives a silent peer this long per socket operation.
+LISTENER_MAX_REQUEST_BYTES = 16 * 1024
+LISTENER_SOCKET_TIMEOUT = 5
+AUTH_CODE_RE = re.compile(r"^[A-Za-z0-9_-]{1,2048}$")
+
+
+class CappedReader:
+    """The listener's view of a request stream: `limit` bytes in total, however
+    much the peer sends. http.server otherwise accepts a 64 KiB request line
+    plus a hundred 64 KiB header lines."""
+
+    def __init__(self, raw, limit):
+        self.raw = raw
+        self.left = limit
+
+    def _budget(self, size):
+        return self.left if size is None or size < 0 else min(size, self.left)
+
+    def readline(self, size=-1):
+        budget = self._budget(size)
+        if budget <= 0:
+            return b""
+        line = self.raw.readline(budget)
+        self.left -= len(line)
+        return line
+
+    def read(self, size=-1):
+        budget = self._budget(size)
+        if budget <= 0:
+            return b""
+        data = self.raw.read(budget)
+        self.left -= len(data)
+        return data
+
+    def close(self):
+        self.raw.close()
+
+
 class CallbackHandler(BaseHTTPRequestHandler):
     result = {}
     expected_state = ""
+    timeout = LISTENER_SOCKET_TIMEOUT
+
+    def setup(self):
+        super().setup()
+        self.rfile = CappedReader(self.rfile, LISTENER_MAX_REQUEST_BYTES)
 
     def log_message(self, fmt, *args):  # silence the default stderr chatter
         pass
@@ -934,8 +1606,10 @@ class CallbackHandler(BaseHTTPRequestHandler):
             return
         query = urllib.parse.parse_qs(parsed.query)
         state = (query.get("state") or [""])[0]
-        if state != CallbackHandler.expected_state:
-            CallbackHandler.result = {"error": "state_mismatch"}
+        code = (query.get("code") or [""])[0]
+        if not secrets.compare_digest(state.encode("utf-8"), CallbackHandler.expected_state.encode("utf-8")):
+            # Any web page can point the browser here. A request without this
+            # login's state neither completes nor cancels it; keep waiting.
             body = "Login response did not match this request. Try connecting again."
         elif query.get("error"):
             # Anything from the query string is untrusted: a page could send the
@@ -943,8 +1617,11 @@ class CallbackHandler(BaseHTTPRequestHandler):
             reason = query["error"][0][:80]
             CallbackHandler.result = {"error": reason}
             body = "Spotify reported: %s. You can close this tab." % html.escape(reason)
+        elif not AUTH_CODE_RE.match(code):
+            CallbackHandler.result = {"error": "malformed_code"}
+            body = "Login response was malformed. Try connecting again."
         else:
-            CallbackHandler.result = {"code": (query.get("code") or [""])[0]}
+            CallbackHandler.result = {"code": code}
             body = "Connected to Spotify. You can close this tab and go back to your bar."
         page = ("<!doctype html><meta charset=utf-8><title>Omarchy Spotify</title>"
                 "<body style=\"font-family:monospace;background:#101315;color:#cacccc;display:flex;"
@@ -963,6 +1640,8 @@ def cmd_auth(args):
     if not client_id:
         return fail("no_client_id", "A Spotify app Client ID is required")
     port = int(args.port)
+    if not 1024 <= port <= 65535:
+        return fail("bad_args", "The redirect port must be between 1024 and 65535")
     redirect_uri = "http://127.0.0.1:%d/callback" % port
 
     verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).decode("ascii").rstrip("=")
@@ -990,11 +1669,11 @@ def cmd_auth(args):
     if args.print_url:
         sys.stderr.write(authorize_url + "\n")
     if not args.no_browser:
-        opener = shutil.which("xdg-open") or shutil.which("omarchy-launch-browser")
-        if opener:
+        browser = trusted_tool("xdg-open") or trusted_tool("omarchy-launch-browser", TRUSTED_OMARCHY_DIRS)
+        if browser:
             try:
-                subprocess.Popen([opener, authorize_url], start_new_session=True,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.Popen([browser, authorize_url], start_new_session=True, env=child_env(display=True),
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except OSError:
                 pass
 
@@ -1397,6 +2076,7 @@ def build_parser():
 
 
 def main(argv):
+    scrub_environment()
     args = build_parser().parse_args(argv)
     try:
         args.fn(args)
