@@ -240,10 +240,11 @@ Panel {
     service.startAuth(id)
   }
 
+  // Started as an absolute argv with a closed environment by the service,
+  // never as shell text through bar.run.
   function launchInstall() {
-    if (!bar) return
-    bar.run("omarchy-launch-floating-terminal-with-presentation " + Util.shellQuote(Model.installCommand))
-    close()
+    if (!service) return
+    if (service.launchInstall()) close()
   }
 
   function switchPanel(direction) {
@@ -955,7 +956,7 @@ Panel {
                 horizontalPadding: Style.space(10)
                 verticalPadding: Style.space(4)
                 onClicked: {
-                  if (root.service && root.service.appRunning && root.bar) root.bar.run("omarchy-launch-or-focus spotify")
+                  if (root.service && root.service.appRunning) root.service.focusApp()
                   else if (root.service) root.service.launchApp()
                 }
               }
@@ -1150,7 +1151,7 @@ Panel {
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
-              text: "Get the binary from a source you trust, not from this panel:\n  ·  your package manager — on Arch/Omarchy the AUR package spotify-soloist-bin\n  ·  or Spotify's own instructions at developer.spotify.com/documentation/soloist\nOnce a soloist binary is on your PATH (or in ~/.local/bin), come back here."
+              text: "Get the binary from a source you trust, not from this panel:\n  ·  your package manager — on Arch/Omarchy the AUR package spotify-soloist-bin\n  ·  or Spotify's own instructions at developer.spotify.com/documentation/soloist\nOnce a package has put soloist in /usr/bin, or you have unpacked it into ~/.local/bin, come back here. Your PATH is not searched."
             }
 
             // A weekly auto-updater that an older version of this plugin

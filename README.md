@@ -128,7 +128,11 @@ running something unverified, which is the right way round.)
      <https://developer.spotify.com/documentation/soloist>, unpacking the
      `soloist` binary into `~/.local/bin`.
 
-   The plugin looks for `soloist` on your `PATH` and in `~/.local/bin`.
+   The plugin looks for `soloist` in the system directories (`/usr/bin`,
+   `/bin`, …) and in `~/.local/bin` — not on your `PATH`. A copy in
+   `~/.local/bin` is used only if it is a regular executable owned by you (or
+   root) that nobody else can write to, in a directory nobody else can write
+   to, wherever a symlink there points.
 2. Under the device button, in **Headless player**, click **Set up Soloist**.
    That writes one systemd *user* unit (`~/.config/systemd/user/soloist.service`)
    pointing at the binary you installed, plus `~/.config/soloist/soloist.env`.
@@ -267,7 +271,9 @@ omarchy-shell spotify status                 # JSON: playing, title, artist, dev
 
 Bind them in `~/.config/hypr/bindings.lua` for media keys. The helper
 `bin/spotify-bridge` is a normal command-line tool too; `--help` lists
-everything it can do.
+everything it can do. It runs under `/usr/bin/python3 -I` and replaces its
+inherited environment with a short allow-list as soon as it starts, exactly
+as it does under the panel.
 
 ## How it's built
 
@@ -301,9 +307,51 @@ expose their track lists, and the connection must be renewed every six months.
   browser login talks to a listener on `127.0.0.1` only, checks the `state`
   it issued, and escapes anything it echoes.
 - **No shell, no eval.** Every command the plugin runs is an argument list;
-  nothing from Spotify or from you is ever pasted into a shell string.
-  IDs and URIs are validated before they go into an API path. Text from
-  Spotify is rendered as plain text, never as rich text.
+  nothing from Spotify or from you is ever pasted into a shell string, and
+  nothing goes through `bash -c` or the bar's shell runner. IDs and URIs are
+  validated before they go into an API path. Text from Spotify is rendered as
+  plain text, never as rich text.
+- **Nothing runs through your PATH or inherits your environment.** At startup
+  the service probes a fixed list of absolute interpreters (`/usr/bin/python3`,
+  `/bin/python3`, `/run/current-system/sw/bin/python3`) and runs the bridge as
+  `<that python> -I -B bin/spotify-bridge …`: `-I` ignores every `PYTHON*`
+  variable and user site-packages, and the script's `#!` line is never used.
+  If none is found, nothing runs. The bridge gets a cleared environment —
+  a fixed `PATH` of root-owned system directories, the XDG directories, the
+  session bus, and the display handles the login needs to open a browser —
+  and scrubs its own environment again on entry. Every program the bridge
+  starts (`systemctl`, `pgrep`, `xdg-open`) is an absolute path found in
+  `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin` or `/run/current-system/sw/bin`,
+  and only if it and every directory leading to it are root-owned and
+  writable by nobody else; each child gets a rebuilt environment too. The
+  three things the panel launches detached when you click — the Spotify app
+  via `uwsm-app`, Omarchy's launch-or-focus, and Omarchy's floating terminal
+  for the app installer — use absolute paths from that same resolution,
+  re-checked in `Model.js`, with a cleared environment. `LD_PRELOAD`,
+  `BASH_ENV`, exported shell functions, proxies and `/usr/local/bin` or
+  `~/.local/bin` entries never reach any of them.
+- **State files are opened defensively.** `auth.json`, `last-played.json`,
+  `soloist.env`, the systemd unit and the cover cache are all reached through
+  a directory held open by descriptor, walked from `/` with every directory
+  checked to be yours or root's and writable by nobody else; the plugin's own
+  directories must be real directories (never symlinks) and are kept at 0700.
+  Reads use `O_NOFOLLOW|O_NONBLOCK` and are refused — not silently treated as
+  empty — if the entry is a symlink, FIFO or device, not owned by you, hard
+  linked, open to other users, or larger than a fixed cap (64 KiB for the
+  login). Writes go to a fresh random temp name created with
+  `O_CREAT|O_EXCL|O_NOFOLLOW` at 0600, are fsynced, and are renamed into place
+  inside the same held directory; an existing destination that is not a
+  regular file you own is refused rather than replaced.
+- **Every network body is capped.** Web API and token replies are limited to
+  2 MiB, error bodies to 64 KiB, cover art to 8 MB — checked against
+  `Content-Length` first, then enforced while reading, with an overall
+  deadline on top of the socket timeout. Redirects are never followed (so the
+  bearer token is never replayed elsewhere), proxies are not taken from the
+  environment, only HTTPS is spoken, and cover art is fetched only from
+  Spotify's image CDNs (`*.scdn.co`, `*.spotifycdn.com`). The login listener
+  reads at most 16 KiB of any request, times out idle connections, and
+  ignores a callback that does not carry its `state` instead of aborting the
+  login.
 - **The plugin downloads no executables.** It never fetches, installs,
   updates or replaces a binary, and it ships no timer or service that could.
   Spotify serves its Soloist builds from a single mutable URL with no

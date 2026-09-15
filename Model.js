@@ -352,3 +352,149 @@ function setupSteps(port) {
 // The desktop app is the Spotify Connect device the panel drives. Reuse
 // Omarchy's own installer so the package choice stays theirs.
 var installCommand = "omarchy install service spotify"
+
+// ---------------------------------------------------------------------------
+// Trusted executables and closed environments
+//
+// The shell never starts a program through the session PATH and never hands
+// one the session environment:
+//  - the bridge runs as `<absolute python3> -I -B bin/spotify-bridge …`. -I
+//    ignores every PYTHON* variable and user site-packages and keeps the
+//    script's own directory off sys.path. The interpreter is found by a
+//    startup probe over pythonCandidates, never via `#!/usr/bin/env`.
+//  - its environment is cleared down to bridgeEnvironmentNames and a fixed PATH.
+//  - detached launches (the Spotify app, Omarchy's launch-or-focus and
+//    floating-terminal scripts) use absolute paths the bridge resolved from
+//    root-owned directories, accepted here only inside those directories and
+//    only under the expected name, with the environment cleared down to
+//    launchEnvironmentNames.
+// ---------------------------------------------------------------------------
+
+// /usr/local/bin and anything under $HOME are deliberately absent: those are
+// the usual landing spots for a shadow binary.
+var trustedBinaryDirectories = ["/usr/bin", "/bin", "/usr/sbin", "/sbin", "/run/current-system/sw/bin"]
+// Omarchy's own scripts ship in its tree.
+var trustedOmarchyDirectories = ["/usr/share/omarchy/bin", "/usr/local/share/omarchy/bin"]
+var trustedPathEnvironment = trustedBinaryDirectories.join(":")
+// Omarchy's launcher scripts name their helpers (uwsm-app, xdg-terminal-exec,
+// omarchy-show-logo) bare, so their PATH carries the Omarchy tree as well —
+// still no directory a user can write to.
+var trustedSessionPathEnvironment = trustedBinaryDirectories.concat(["/usr/share/omarchy/bin"]).join(":")
+
+var pythonCandidates = ["/usr/bin/python3", "/bin/python3", "/run/current-system/sw/bin/python3"]
+var pythonVersionCheck = "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 3)"
+
+// The bridge keeps its XDG directories, the session bus for
+// `systemctl --user`, and the display handles the one-time login needs to
+// open a browser.
+var bridgeEnvironmentNames = [
+  "HOME", "USER", "LOGNAME", "LANG",
+  "XDG_RUNTIME_DIR", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+  "DBUS_SESSION_BUS_ADDRESS", "WAYLAND_DISPLAY", "DISPLAY",
+  "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "XDG_SESSION_DESKTOP", "HYPRLAND_INSTANCE_SIGNATURE"
+]
+
+// A GUI launch additionally keeps the toolkit and input-method switches the
+// session sets — which backend, which scale, which input method: names and
+// numbers only. Anything that names a file or a program to load (LD_*,
+// BASH_ENV, exported shell functions, QT_PLUGIN_PATH, TERMINAL, EDITOR,
+// XDG_DATA_DIRS, proxies) is left behind.
+var launchEnvironmentNames = bridgeEnvironmentNames.concat([
+  "XDG_SESSION_ID", "XDG_SEAT", "XDG_BACKEND", "DESKTOP_SESSION",
+  "GDK_BACKEND", "GDK_SCALE", "QT_QPA_PLATFORM", "QT_QPA_PLATFORMTHEME", "QT_IM_MODULE",
+  "SDL_IM_MODULE", "XMODIFIERS", "INPUT_METHOD", "MOZ_ENABLE_WAYLAND",
+  "ELECTRON_OZONE_PLATFORM_HINT", "OZONE_PLATFORM", "XCURSOR_SIZE", "HYPRCURSOR_SIZE",
+  "_JAVA_AWT_WM_NONREPARENTING"
+])
+
+// Set to a fixed value rather than inherited: Omarchy's scripts locate their
+// own tree through it.
+var launchFixedEnvironment = { OMARCHY_PATH: "/usr/share/omarchy" }
+
+// Clean absolute paths only: every component starts with a letter or digit,
+// so no `..`, no hidden component, no whitespace or quoting characters.
+var trustedExecutablePattern = /^\/[A-Za-z0-9][A-Za-z0-9._+-]*(?:\/[A-Za-z0-9][A-Za-z0-9._+-]*)*$/
+
+function isObjectMap(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+}
+
+// `value` when it is a clean absolute path directly inside one of
+// `directories` (the system directories by default); "" otherwise.
+function trustedExecutable(value, directories) {
+  var text = typeof value === "string" ? value : ""
+  if (text === "" || text.length > 256 || !trustedExecutablePattern.test(text)) return ""
+  var allowed = directories || trustedBinaryDirectories
+  return allowed.indexOf(text.substring(0, text.lastIndexOf("/"))) >= 0 ? text : ""
+}
+
+function basename(path) {
+  return String(path).substring(String(path).lastIndexOf("/") + 1)
+}
+
+// A complete environment for a Process with clearEnvironment: the listed
+// names that hold a bounded single-line value, then any fixed values, then
+// PATH, which nothing inherited can override.
+function closedEnvironment(inherited, names, path, fixed) {
+  var environment = {}
+  var source = isObjectMap(inherited) ? inherited : {}
+  var list = Array.isArray(names) ? names : []
+  for (var i = 0; i < list.length; i++) {
+    var value = source[list[i]]
+    if (typeof value !== "string" || value === "" || value.length > 4096) continue
+    if (/[\x00-\x1f\x7f]/.test(value)) continue
+    environment[list[i]] = value
+  }
+  if (isObjectMap(fixed)) for (var key in fixed) environment[key] = String(fixed[key])
+  environment.PATH = String(path || trustedPathEnvironment)
+  return environment
+}
+
+function pythonProbeCommand(candidate) {
+  var python = trustedExecutable(candidate)
+  return python === "" ? [] : [python, "-I", "-c", pythonVersionCheck]
+}
+
+// Empty (so nothing starts) unless the interpreter is trusted and the script
+// path is absolute.
+function bridgeCommand(python, bridgePath, args) {
+  var interpreter = trustedExecutable(python)
+  var script = typeof bridgePath === "string" ? bridgePath : ""
+  if (interpreter === "" || script.charAt(0) !== "/" || /[\x00-\x1f\x7f]/.test(script)) return []
+  var argv = [interpreter, "-I", "-B", script]
+  var rest = Array.isArray(args) ? args : []
+  for (var i = 0; i < rest.length; i++) argv.push(String(rest[i]))
+  return argv
+}
+
+var launchToolDirectories = {
+  "uwsm-app": trustedBinaryDirectories,
+  "omarchy-launch-or-focus": trustedBinaryDirectories.concat(trustedOmarchyDirectories),
+  "omarchy-launch-floating-terminal-with-presentation": trustedBinaryDirectories.concat(trustedOmarchyDirectories)
+}
+
+// A launcher path from the bridge's `tools` table, accepted only inside the
+// directories allowed for that tool and only under that tool's own name.
+function toolPath(tools, name) {
+  var directories = launchToolDirectories[name]
+  if (!directories || !isObjectMap(tools)) return ""
+  var path = trustedExecutable(tools[name], directories)
+  return path !== "" && basename(path) === name ? path : ""
+}
+
+function appLaunchCommand(tools, appBinary) {
+  var uwsm = toolPath(tools, "uwsm-app")
+  var app = trustedExecutable(appBinary)
+  if (uwsm === "" || app === "" || (basename(app) !== "spotify" && basename(app) !== "spotify-launcher")) return []
+  return [uwsm, "--", app]
+}
+
+function focusAppCommand(tools) {
+  var focus = toolPath(tools, "omarchy-launch-or-focus")
+  return focus === "" ? [] : [focus, "spotify"]
+}
+
+function installLaunchCommand(tools) {
+  var terminal = toolPath(tools, "omarchy-launch-floating-terminal-with-presentation")
+  return terminal === "" ? [] : [terminal, installCommand]
+}
