@@ -15,7 +15,7 @@ dest="$HOME/.config/omarchy/plugins/$id"
 
 mkdir -p "$dest"
 # Only ship what the shell needs; git history and screenshots stay behind.
-for entry in manifest.json Model.js Service.qml BarWidget.qml Panel.qml README.md LICENSE bin contrib; do
+for entry in manifest.json Model.js Service.qml BarWidget.qml Panel.qml README.md LICENSE bin; do
   [[ -e "$src/$entry" ]] && cp -r "$src/$entry" "$dest/"
 done
 chmod +x "$dest/bin/spotify-bridge"

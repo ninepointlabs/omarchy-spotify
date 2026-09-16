@@ -230,35 +230,188 @@ class StateFileTests(TempHome):
             self.assertEqual(bridge.cache_one("https://evil.example/cover.jpg"), "")
         fetch.assert_not_called()
 
-    def test_soloist_env_is_private_and_a_symlink_is_refused(self):
-        bridge.write_soloist_env(key="abcdefgh1234")
-        path = os.path.join(self.home, ".config", "soloist", "soloist.env")
-        self.assertEqual(mode_of(path), 0o600)
-        self.assertIn("SOLOIST_API_KEY=abcdefgh1234", bridge.read_soloist_env())
-        os.unlink(path)
-        os.symlink(self.victim, path)
-        with self.assertRaises(bridge.UnsafePath):
-            bridge.read_soloist_env()
-        with self.assertRaises(bridge.UnsafePath):
-            bridge.write_soloist_env(key="abcdefgh5678")
-        self.assertVictimIntact()
-
-    def test_unit_is_written_and_a_symlinked_unit_is_never_ours(self):
-        bridge.write_soloist_unit("/usr/bin/true")
-        unit = os.path.join(self.home, ".config", "systemd", "user", "soloist.service")
+    def test_a_symlinked_unit_is_never_ours_and_removal_takes_the_link(self):
+        """The plugin no longer writes a unit, but it still removes the
+        key-bearing one older versions left behind. That removal must take the
+        name out of ~/.config/systemd/user and never follow it somewhere else."""
+        unit_dir = os.path.join(self.home, ".config", "systemd", "user")
+        os.makedirs(unit_dir, mode=0o700)
+        unit = os.path.join(unit_dir, "soloist.service")
+        with open(unit, "w") as fh:
+            fh.write(bridge.UNIT_MARKER + "\n[Service]\nExecStart=/usr/bin/soloist\n")
         self.assertTrue(bridge.unit_is_ours())
-        self.assertEqual(mode_of(unit), 0o644)
         with open(self.victim, "w") as fh:
             fh.write(bridge.UNIT_MARKER + "\n")
         os.unlink(unit)
         os.symlink(self.victim, unit)
+        # A link is never read as ours, however convincing what it points at.
         self.assertFalse(bridge.unit_is_ours())
-        with self.assertRaises(bridge.UnsafePath):
-            bridge.write_soloist_unit("/usr/bin/true")
-        # Removing the unit takes out the link itself, never what it points at.
         bridge.remove_our_unit()
         self.assertFalse(os.path.lexists(unit))
         self.assertTrue(os.path.exists(self.victim))
+
+
+class NoCredentialPathTests(unittest.TestCase):
+    """Soloist takes its API key only from `-k/--api-key` on the command line,
+    so anything that starts Soloist puts the key where `ps`, `systemctl status`
+    and crash reports can read it. The plugin's answer is to start nothing and
+    store nothing: these tests pin that the credential path is gone from the
+    shipped tree rather than merely unused."""
+
+    def test_the_bridge_has_no_unit_or_key_writer(self):
+        for name in ("write_soloist_env", "write_soloist_unit", "read_soloist_env",
+                     "soloist_config_dir", "SOLOIST_KEY_RE"):
+            self.assertFalse(hasattr(bridge, name), "%s is back" % name)
+
+    def test_the_soloist_verbs_cannot_set_up_or_store_a_key(self):
+        parser = bridge.build_parser()
+        for verb in ("setup", "key"):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["soloist", verb, "--device-name", "x"])
+        self.assertEqual(parser.parse_args(["soloist", "audit"]).action, "audit")
+
+    def test_no_shipped_file_declares_a_command_to_run(self):
+        """A repository-wide sweep, so a unit template — the only thing that
+        ever put the key on a command line — cannot come back in any file the
+        marketplace would ship.
+
+        Markdown and `tests/` are exempt, and neither weakens the check: prose
+        is not something systemd can load, and the suite has to name the
+        pattern in order to look for it. Anything systemd *could* load is
+        covered here and by `test_no_systemd_unit_is_shipped`."""
+        offenders = []
+        for path in sorted(ROOT.rglob("*")):
+            rel = str(path.relative_to(ROOT))
+            if not path.is_file() or rel.startswith((".git/", "tests/")):
+                continue
+            if path.suffix in (".png", ".jpg", ".md"):
+                continue
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if line.lstrip().startswith(("ExecStart=", "ExecStartPre=", "EnvironmentFile=")):
+                    offenders.append("%s: %s" % (rel, line.strip()[:80]))
+        self.assertEqual(offenders, [], "a systemd unit is shipped again")
+
+    def test_no_systemd_unit_is_shipped(self):
+        self.assertFalse((ROOT / "contrib" / "systemd").exists())
+        self.assertEqual(list(ROOT.glob("**/*.service")), [])
+
+    def test_the_panel_has_no_key_entry(self):
+        for name in ("Panel.qml", "Service.qml"):
+            body = (ROOT / name).read_text(encoding="utf-8")
+            self.assertNotIn("setSoloistKey", body)
+            self.assertNotIn("soloistKeyField", body)
+
+
+def fake_soloist(tmpdir, args, marker):
+    """A live process whose command line looks exactly like Soloist's, so the
+    audit can be pointed at real /proc entries rather than a fixture. Python is
+    exec'd under the name `soloist`; everything after the -c script lands in
+    the command line as Soloist's own arguments would."""
+    name = os.path.join(tmpdir, "soloist")
+    argv = [name, "-c", "import time; time.sleep(%d)" % 30, "--device-name", marker] + args
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - the child never returns
+        try:
+            os.execv(sys.executable, argv)
+        finally:
+            os._exit(127)
+    return pid
+
+
+class ArgvAuditTests(unittest.TestCase):
+    """`soloist audit` — the check the marketplace review asks for. It reads
+    live unit and process metadata and reports whether a Soloist API key is
+    reachable from a command line, without ever echoing the key."""
+
+    SECRET = "s3cr3t-soloist-key-value"
+
+    def setUp(self):
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="soloist-audit-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.pids = []
+        # No unit on the machine running the tests may leak into the result.
+        patcher = mock.patch.object(bridge, "systemctl_user", return_value=(1, ""))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def spawn(self, args, marker):
+        pid = fake_soloist(self.tmp, args, marker)
+        self.pids.append(pid)
+        self.addCleanup(self.reap, pid)
+        # Wait for the exec to land, so /proc shows the new command line.
+        for _ in range(200):
+            try:
+                with open("/proc/%d/cmdline" % pid, "rb") as fh:
+                    if marker.encode() in fh.read():
+                        return pid
+            except OSError:
+                pass
+            time.sleep(0.01)
+        self.fail("the fake soloist never showed up in /proc")
+
+    def reap(self, pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
+
+    def test_both_spellings_of_the_key_argument_are_recognised(self):
+        self.assertTrue(bridge.argv_carries_key(["soloist", "-k", self.SECRET]))
+        self.assertTrue(bridge.argv_carries_key(["soloist", "--api-key", self.SECRET]))
+        self.assertTrue(bridge.argv_carries_key(["soloist", "--api-key=" + self.SECRET]))
+        self.assertFalse(bridge.argv_carries_key(["soloist", "--device-name", "Omarchy"]))
+        # A dangling flag with no value is not a key on the command line.
+        self.assertFalse(bridge.argv_carries_key(["soloist", "--api-key"]))
+
+    def test_a_finding_never_carries_the_key_itself(self):
+        for argv in (["soloist", "-k", self.SECRET],
+                     ["soloist", "--api-key", self.SECRET],
+                     ["soloist", "--api-key=" + self.SECRET]):
+            safe = bridge.redact_argv(argv)
+            self.assertNotIn(self.SECRET, " ".join(safe))
+            self.assertIn("<redacted>", " ".join(safe))
+
+    def test_a_live_key_bearing_process_is_found_and_reported_redacted(self):
+        self.spawn(["-k", self.SECRET], "audit-leaky")
+        report = bridge.soloist_argv_audit()
+        self.assertTrue(report["keyInCommandLine"])
+        self.assertFalse(report["pluginWritesUnit"])
+        self.assertFalse(report["pluginStoresKey"])
+        leaky = [f for f in report["findings"]
+                 if f["source"] == "process" and "audit-leaky" in " ".join(f["argv"])]
+        self.assertEqual(len(leaky), 1)
+        self.assertNotIn(self.SECRET, json.dumps(report))
+
+    def test_a_soloist_started_without_a_key_audits_clean(self):
+        """The scanner must not cry wolf over an ordinary Soloist command line.
+        Scoped to this process by its marker, since the machine running the
+        tests may have a real Soloist of its own."""
+        pid = self.spawn([], "audit-clean")
+        report = bridge.soloist_argv_audit()
+        self.assertGreaterEqual(report["processesChecked"], 1)
+        ours = [f for f in report["findings"]
+                if f["where"] == "/proc/%d/cmdline" % pid or "audit-clean" in " ".join(f["argv"])]
+        self.assertEqual(ours, [])
+
+    def test_a_unit_that_expands_the_key_is_reported_without_it(self):
+        """`systemctl show` reports ExecStart with `${SOLOIST_API_KEY}` still
+        unexpanded, so the audit sees the shape of the command line and never
+        the key — and reports it redacted even so."""
+        shown = "\n".join([
+            "FragmentPath=/home/someone/.config/systemd/user/soloist.service",
+            "ExecStart={ path=/usr/bin/soloist ; argv[]=/usr/bin/soloist --device-name Omarchy "
+            "--api-key ${SOLOIST_API_KEY} --ws 127.0.0.1:0 ; ignore_errors=no }",
+        ])
+        with mock.patch.object(bridge, "systemctl_user", return_value=(0, shown)):
+            report = bridge.soloist_argv_audit()
+        self.assertEqual(report["findings"][0]["where"],
+                         "/home/someone/.config/systemd/user/soloist.service")
+        unit = [f for f in report["findings"] if f["source"] == "unit"]
+        self.assertEqual(len(unit), 1)
+        self.assertIn("<redacted>", unit[0]["argv"])
+        self.assertNotIn("${SOLOIST_API_KEY}", " ".join(unit[0]["argv"]))
+        self.assertTrue(report["keyInCommandLine"])
 
 
 class HostileServer(http.server.BaseHTTPRequestHandler):

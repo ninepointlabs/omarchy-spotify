@@ -133,15 +133,13 @@ running something unverified, which is the right way round.)
    `~/.local/bin` is used only if it is a regular executable owned by you (or
    root) that nobody else can write to, in a directory nobody else can write
    to, wherever a symlink there points.
-2. Under the device button, in **Headless player**, click **Set up Soloist**.
-   That writes one systemd *user* unit (`~/.config/systemd/user/soloist.service`)
-   pointing at the binary you installed, plus `~/.config/soloist/soloist.env`.
-   No download happens. If a package already provides a `soloist.service`, the
-   plugin leaves it alone and uses that one.
-3. Get a key from <https://developer.spotify.com/dashboard>: open
-   **Spotify Soloist API Key**, accept the terms, click Generate. Paste it
-   into the panel and click **Start**.
-4. Open the Spotify app on your phone or computer, open its device picker,
+2. Give Soloist a service to run under — see
+   [Running Soloist yourself](#running-soloist-yourself) below. **The plugin
+   does not write one**, for the same reason it does not download the binary:
+   Soloist takes its API key only as a command-line argument, and a unit
+   generated here would have to put your key into a command line that anyone
+   who can read `/proc` can see.
+3. Open the Spotify app on your phone or computer, open its device picker,
    and choose **Omarchy** once. That pairs it. Soloist remembers the session
    from then on.
 
@@ -153,18 +151,60 @@ Spotify's builds stop working about 90 days after they are made. When that
 happens the panel says so; update Soloist the same way you installed it
 (`yay -Syu`, or a fresh unpack). Nothing updates it behind your back.
 
-**Remove Soloist service** takes out only what the plugin put there: the
-`soloist.service` it wrote into `~/.config/systemd/user/`, plus any leftover
-updater units from an older version. It leaves `~/.config/soloist/soloist.env`
-alone so your key survives, and it never touches the binary — that is yours or
-your package manager's.
+#### Running Soloist yourself
 
-> **Upgrading from an earlier version?** Versions before this one downloaded
-> the binary and installed a weekly `soloist-update.timer` that re-downloaded
-> it. Both are gone. If your machine still has that timer, the panel shows
-> **Remove the old auto-updater** — one click disables and deletes
-> `soloist-update.service`, `soloist-update.timer` and `~/.local/bin/soloist-update`.
-> Or run `bin/spotify-bridge soloist drop-updater`.
+Soloist needs a service, and writing it is yours to do. If your package ships
+one, use that. Otherwise a minimal `~/.config/systemd/user/soloist.service`
+looks like this — fill in the path to your binary and your key:
+
+```ini
+[Unit]
+Description=Spotify Soloist
+After=pipewire.service network-online.target
+Wants=pipewire.service network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/soloist --device-name Omarchy --api-key YOUR_KEY_HERE --ws 127.0.0.1:0
+Restart=on-failure
+RestartSec=5
+# Soloist exits 10 when the build expires; restarting won't help.
+RestartPreventExitStatus=10
+
+[Install]
+WantedBy=default.target
+```
+
+Then `systemctl --user daemon-reload && systemctl --user enable --now soloist`.
+
+Get the key from <https://developer.spotify.com/dashboard>: open
+**Spotify Soloist API Key**, accept the terms, click Generate.
+
+**Read this before you paste your key in.** However you write that unit, the
+key ends up on Soloist's command line, because Soloist accepts it no other way
+(see [The API key and the command line](#the-api-key-and-the-command-line)).
+Anything that can read `/proc` on this machine can read it there. Keep the unit
+file itself at `0600` if you put the key straight into it, or keep it in a
+`0600` `EnvironmentFile` and expand it — that protects the file, not the
+command line. To see exactly what is exposed right now:
+
+```sh
+bin/spotify-bridge soloist audit
+```
+
+That reads the live unit and the running process and tells you whether the key
+is on a command line, without printing the key itself.
+
+> **Upgrading from an earlier version?** Versions before this one wrote a
+> `soloist.service` for you, with your key expanded into `ExecStart`. That unit
+> is still on your machine and still exposes the key; the panel now says so and
+> offers **Remove the old plugin service** — one click disables and deletes
+> `~/.config/systemd/user/soloist.service`. Replace it with a unit of your own
+> from the template above, and consider regenerating the key, since it has been
+> readable in the process list for as long as that unit has been running. Even
+> older versions also installed a weekly `soloist-update.timer` that
+> re-downloaded the binary; if yours still has it, the panel shows **Remove the
+> old auto-updater**, or run `bin/spotify-bridge soloist drop-updater`.
 
 > **Why not spotifyd or librespot?** Since late 2025 Spotify refuses to give
 > those open-source players the keys to decode audio for accounts created in
@@ -183,7 +223,7 @@ your package manager's.
 | A row, click | play it (tracks, episodes, chapters, artists) or open it (playlists, albums, podcasts, audiobooks) |
 | A row, right click | add to queue |
 | Hover a row | reveals **+** (queue) and **▶** (play) |
-| Device button | switch device, set up or start Soloist, sign out |
+| Device button | switch device, start or stop Soloist, sign out |
 
 ### Keyboard cheat sheet
 
@@ -253,8 +293,10 @@ omarchy plugin remove ninepointlabs.spotify          # the plugin
 rm -rf ~/.local/state/omarchy-spotify ~/.cache/omarchy-spotify   # login and cover cache
 ```
 
-If you set up Soloist, click **Remove Soloist service** in the panel first (or
-run `bin/spotify-bridge soloist remove`), then optionally
+If an earlier version of the plugin wrote a `soloist.service` for you, click
+**Remove the old plugin service** in the panel first (or run
+`bin/spotify-bridge soloist remove`). A unit you wrote, or one from a package,
+is yours to remove — the plugin refuses to touch it. Then optionally
 `rm -rf ~/.config/soloist ~/.local/share/soloist ~/.cache/soloist`. The
 `soloist` binary itself is not the plugin's to remove — uninstall it the way
 you installed it.
@@ -287,10 +329,10 @@ as it does under the panel.
   15 while something plays with the panel closed, and every minute when idle.
 - `BarWidget.qml` is the chip, `Panel.qml` the popup. They use the same
   building blocks as Omarchy's own panels, so they follow your theme.
-- `contrib/systemd/soloist.service` is the template for the one systemd user
-  unit the Soloist setup writes. `@SOLOIST_BIN@` in it is replaced with the
-  path of the `soloist` binary already on the machine. There is no downloader
-  and no updater in the plugin.
+- There is no systemd unit in this repository, and nothing in the plugin
+  writes one — see [The API key and the command line](#the-api-key-and-the-command-line).
+  `bin/spotify-bridge soloist` only audits, starts, stops and cleans up. There
+  is no downloader and no updater either.
 
 Spotify's February 2026 rules for apps like this one shape a few things:
 search shows at most 10 results per type, other people's playlists don't
@@ -298,11 +340,11 @@ expose their track lists, and the connection must be renewed every six months.
 
 ## Security notes
 
-- **What is stored where.** Your Spotify login (a refresh token, no
-  password) lives in `~/.local/state/omarchy-spotify/auth.json`, and the
-  Soloist key in `~/.config/soloist/soloist.env`. Both are created with
-  mode 0600, readable only by your user. The Client ID in `shell.json` is
-  not a secret.
+- **What is stored where.** The only secret the plugin stores is your Spotify
+  login — a refresh token, no password — in
+  `~/.local/state/omarchy-spotify/auth.json`, created with mode 0600 and
+  readable only by your user. The Client ID in `shell.json` is not a secret.
+  The Soloist API key is not stored by the plugin at all.
 - **Login is PKCE.** There is no client secret anywhere. The one-time
   browser login talks to a listener on `127.0.0.1` only, checks the `state`
   it issued, and escapes anything it echoes.
@@ -331,7 +373,7 @@ expose their track lists, and the connection must be renewed every six months.
   `BASH_ENV`, exported shell functions, proxies and `/usr/local/bin` or
   `~/.local/bin` entries never reach any of them.
 - **State files are opened defensively.** `auth.json`, `last-played.json`,
-  `soloist.env`, the systemd unit and the cover cache are all reached through
+  a systemd unit being checked for removal, and the cover cache are reached through
   a directory held open by descriptor, walked from `/` with every directory
   checked to be yours or root's and writable by nobody else; the plugin's own
   directories must be real directories (never symlinks) and are kept at 0700.
@@ -359,36 +401,59 @@ expose their track lists, and the connection must be renewed every six months.
   be bound to any reviewed artifact; installing Soloist is therefore left to
   your package manager or to you. The only thing the plugin downloads at all
   is cover art, over HTTPS, capped at 8 MB per image.
-- **The unit it writes is generated, not fetched.** `Set up Soloist` renders
-  `contrib/systemd/soloist.service` from the plugin's own checkout, with
-  `@SOLOIST_BIN@` replaced by the path of the `soloist` binary it found. That
-  path must match `^/[A-Za-z0-9._+@/-]+$` first, so nothing — no whitespace,
-  quotes, backslashes or newlines — can be smuggled into the unit's
-  `ExecStart` line.
-- **Known limitation.** Soloist only accepts its API key on the command
-  line, so the key is visible in the process list to other users on the
-  same machine (`ps`). On a single-user desktop that's you; on a shared box,
-  treat it accordingly. The plugin itself passes the key over stdin.
+- **The API key and the command line.** Soloist takes its API key exactly one
+  way: `-k/--api-key KEY` as a command-line argument. There is no environment
+  variable, no key file, no file-descriptor handoff and no config file, and
+  Soloist does not scrub its own `argv` afterwards, so the key stays readable
+  in `/proc/PID/cmdline` — to `ps`, to `systemctl status`, to anything that
+  scrapes the process table, and to the crash reporter Soloist embeds — for as
+  long as it runs. Spotify's own [command-line
+  reference](https://developer.spotify.com/documentation/soloist/reference/command-line)
+  documents that one flag and says to treat the value as a secret. Verify it
+  for yourself:
+
+  ```sh
+  # The only documented input, and no environment fallback:
+  soloist --help | grep -- --api-key
+  SOLOIST_API_KEY=x soloist --device-name Test   # → Error: --api-key is required
+  strings "$(command -v soloist)" | grep -c SOLOIST_    # → 0
+  ```
+
+  **So this plugin never handles that key and never starts Soloist.** It writes
+  no unit, stores no key, and has no field to type one into. Whatever runs
+  Soloist has to put the key in a command line, so that decision — and the
+  file it lives in — stays with you and with whatever package or unit you
+  chose, outside the plugin's snapshot. The plugin only reports what it finds:
+
+  ```sh
+  bin/spotify-bridge soloist audit
+  ```
+
+  reads the live unit (`systemctl --user show -p ExecStart`, where variables
+  are still unexpanded) and every running `soloist` command line in `/proc`,
+  and reports whether an API key argument is present. Findings come back with
+  the argument vector redacted, so neither the audit, the panel, nor any error
+  or log line the plugin writes ever reprints the key. `tests/test_bridge.py`
+  pins all of this: that the writers are gone, that no shipped file declares a
+  command to run, that the panel has no key field, and that the audit finds a
+  real key-bearing process in `/proc` while leaving a clean one alone.
 - **Nothing phones home.** The plugin talks to `api.spotify.com`,
   `accounts.spotify.com`, and Spotify's image CDN. That's the full list.
-- **It manages a user service, only if you ask.** Nothing is *written* to
-  systemd until you click **Set up Soloist**; before that the plugin only
-  reads (`systemctl --user is-active` / `show`) while polling status. That
-  step writes exactly two files — `~/.config/systemd/user/soloist.service`
-  and `~/.config/soloist/soloist.env` — and runs
-  `systemctl --user daemon-reload`. Everything is `--user` scope; the plugin
-  never touches system units, never installs a timer, and never asks for
-  root. **Start Soloist**, **Stop**, and **Restart** in the panel map to
-  `systemctl --user start|stop|restart soloist`.
-- **Remove only takes back what the plugin wrote.** The unit it writes carries
-  a `# Managed by the ninepointlabs.spotify Omarchy plugin` marker on its
-  first line, and **Remove Soloist service** deletes a unit only if it carries
-  that marker (or is recognisably the unmarked unit an older version of this
-  plugin wrote, so upgrades can still clean up). A `soloist.service` from a
-  package or one you wrote by hand is never overwritten and never removed, the
-  `soloist` binary is never removed, and `soloist.env` is left in place so
-  your key survives. `install.sh` itself only copies the plugin files into
-  place; it does not install or start any service.
+- **It never creates a user service.** The plugin writes nothing to systemd.
+  It reads (`systemctl --user is-active` / `show`) while polling status, and
+  **Start Soloist**, **Stop** and **Restart** in the panel map to
+  `systemctl --user start|stop|restart soloist` on a unit that was already
+  there. Everything is `--user` scope; the plugin never touches system units,
+  never installs a timer, and never asks for root. `install.sh` only copies
+  the plugin files into place; it does not install or start any service.
+- **The only thing it deletes is its own leftovers.** Units written by earlier
+  versions carry a `# Managed by the ninepointlabs.spotify Omarchy plugin`
+  marker on the first line, and **Remove the old plugin service** deletes a
+  unit only if it carries that marker (or is recognisably the unmarked unit an
+  even older version wrote). A `soloist.service` from a package or one you
+  wrote by hand is refused, not removed, and the `soloist` binary is never
+  touched. `~/.config/soloist/soloist.env` is left alone as well — this
+  version of the plugin does not read, write or even know about that file.
 
 ## License
 

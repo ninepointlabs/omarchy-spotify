@@ -76,8 +76,12 @@ ART_NAME_RE = re.compile(r"^[0-9a-f]{28}\.jpg$")
 
 AUTH_MAX_BYTES = 64 * 1024
 LAST_MAX_BYTES = 16 * 1024
-SOLOIST_ENV_MAX_BYTES = 16 * 1024
 UNIT_MAX_BYTES = 64 * 1024
+# The process table, and the most of any one command line the argv audit reads.
+# Linux caps a command line well below this; the limit only stops the audit
+# from being led anywhere unbounded.
+PROC_DIR = "/proc"
+CMDLINE_MAX_BYTES = 128 * 1024
 
 SPOTIFY_ID_RE = re.compile(r"^[A-Za-z0-9]{1,64}$")
 SPOTIFY_URI_RE = re.compile(r"^spotify:[a-z_]+:[A-Za-z0-9:_-]{1,128}$")
@@ -1145,15 +1149,26 @@ def quiet_ok(argv):
     return run_tool(argv)[0] == 0
 
 
-SOLOIST_ENV_NAME = "soloist.env"
 SOLOIST_UNIT = "soloist"
 SOLOIST_SERVICE = "soloist.service"
-# Stamped into the unit file this plugin writes, so "Remove Soloist" only ever
-# deletes a unit this plugin created and never one from a package.
+# Soloist takes its API key one way only: `-k/--api-key KEY` on the command
+# line. There is no environment variable, no key file, no file descriptor and
+# no config file (verified against the shipped binary and against Spotify's
+# command-line reference), and Soloist does not scrub its own argv, so the key
+# stays readable in /proc/PID/cmdline for the life of the process. A unit this
+# plugin generated would therefore have to expand the secret into ExecStart.
+# It no longer generates one: the service around Soloist is the user's to
+# write or to get from a package, exactly as the binary itself is. Everything
+# below only inspects and controls what is already there.
+KEY_ARGV_FLAGS = ("-k", "--api-key")
+# Stamped into the unit files older versions of this plugin wrote, so "Remove
+# Soloist" only ever deletes a unit this plugin created and never one from a
+# package.
 UNIT_MARKER = "# Managed by the ninepointlabs.spotify Omarchy plugin"
 # Units this plugin wrote before the marker existed carried no stamp. Recognise
-# them by the shape they always had, so an upgrade can still manage and remove
-# them instead of mistaking them for a unit from a package.
+# them by the shape they always had, so an upgrade can still find and remove
+# them instead of mistaking them for a unit from a package. Both shapes carry
+# the key in ExecStart, which is why the panel now offers to take them off.
 LEGACY_UNIT_FINGERPRINT = (
     "Documentation=https://developer.spotify.com/documentation/soloist",
     "--ws 127.0.0.1:0",
@@ -1165,12 +1180,19 @@ LEGACY_UPDATE_UNITS = ["soloist-update.service", "soloist-update.timer"]
 LEGACY_UPDATER_NAME = "soloist-update"
 
 SOLOIST_MISSING_HINT = (
-    "No soloist binary found. Install Spotify Soloist yourself first, then click Set up "
-    "again: on Arch/Omarchy the AUR package spotify-soloist-bin, otherwise the download "
-    "linked from https://developer.spotify.com/documentation/soloist, unpacked into "
-    "~/.local/bin. This plugin deliberately does not fetch it — Spotify publishes no "
-    "checksum and no signature for those builds, so a download could not be verified "
-    "against anything."
+    "No soloist binary found. Install Spotify Soloist yourself: on Arch/Omarchy the AUR "
+    "package spotify-soloist-bin, otherwise the download linked from "
+    "https://developer.spotify.com/documentation/soloist, unpacked into ~/.local/bin. "
+    "This plugin deliberately does not fetch it — Spotify publishes no checksum and no "
+    "signature for those builds, so a download could not be verified against anything."
+)
+
+SOLOIST_UNIT_HINT = (
+    "No soloist.service found. Install Soloist's service from your package, or write "
+    "your own unit for it — the plugin no longer generates one, because Soloist accepts "
+    "its API key only as a command-line argument and a generated unit would have to put "
+    "that secret into the process command line. See the README section \"Running Soloist "
+    "yourself\"."
 )
 
 
@@ -1180,10 +1202,6 @@ def config_home():
 
 def systemd_user_dir(create=False):
     return open_dir(os.path.join(config_home(), "systemd", "user"), (), create)
-
-
-def soloist_config_dir(create=False):
-    return open_dir(config_home(), ("soloist",), create)
 
 
 def user_bin_dir():
@@ -1240,17 +1258,6 @@ def systemctl_user(*args):
     return run_tool([tool, "--user"] + list(args))
 
 
-def read_soloist_env():
-    """Lines of ~/.config/soloist/soloist.env, or None when it does not exist.
-    It holds the API key, so it must be a private (0600) regular file you own."""
-    try:
-        with soloist_config_dir() as held:
-            blob = read_file_at(held, SOLOIST_ENV_NAME, SOLOIST_ENV_MAX_BYTES, private=True)
-    except FileNotFoundError:
-        return None
-    return None if blob is None else blob.decode("utf-8", "replace").splitlines()
-
-
 def legacy_updater_present():
     try:
         with systemd_user_dir() as held:
@@ -1265,29 +1272,161 @@ def legacy_updater_present():
         return False
 
 
+def unit_properties(*names):
+    """Several `systemctl --user show` properties of soloist.service in one
+    subprocess. The status poll wants four or five of these, and spawning
+    systemctl once per property adds up at a four-second poll interval."""
+    args = []
+    for name in names:
+        args += ["-p", name]
+    code, text = systemctl_user("show", *(args + [SOLOIST_SERVICE]))
+    props = dict.fromkeys(names, "")
+    if code != 0:
+        return props
+    for line in text.splitlines():
+        name, sep, value = line.partition("=")
+        if sep and name in props:
+            props[name] = value.strip()
+    return props
+
+
+def redact_argv(argv):
+    """An argument vector with every API key blanked out, so a finding can be
+    shown or logged without reprinting the secret it is complaining about."""
+    safe, skip = [], False
+    for arg in argv:
+        if skip:
+            safe.append("<redacted>")
+            skip = False
+            continue
+        head = arg.split("=", 1)[0]
+        if arg in KEY_ARGV_FLAGS:
+            safe.append(arg)
+            skip = True
+        elif head in KEY_ARGV_FLAGS:
+            safe.append(head + "=<redacted>")
+        else:
+            safe.append(arg)
+    return safe
+
+
+def argv_carries_key(argv):
+    """True when this command line hands Soloist an API key. Both spellings
+    Soloist accepts count: a flag with the key as the next argument, and the
+    joined `--api-key=KEY` form."""
+    for i, arg in enumerate(argv):
+        if arg in KEY_ARGV_FLAGS and i + 1 < len(argv):
+            return True
+        if arg.split("=", 1)[0] in KEY_ARGV_FLAGS and "=" in arg:
+            return True
+    return False
+
+
+def unit_exec_argv(exec_start):
+    """The argument vector systemd is configured to run, pulled out of the
+    `ExecStart` property. Variables are still unexpanded there
+    (`${SOLOIST_API_KEY}` rather than the key), which is exactly what makes
+    this safe to read: it shows the *shape* of the command line without the
+    secret in it."""
+    marker = "argv[]="
+    if marker not in (exec_start or ""):
+        return []
+    return exec_start.split(marker, 1)[1].split(" ; ", 1)[0].strip().split()
+
+
+def live_soloist_argv(pids=None):
+    """Every running Soloist command line this user can see, as (pid, argv).
+
+    Read straight out of /proc, which is where the exposure actually lives:
+    whatever is in argv here is what `ps`, a crash report or a bug-report paste
+    would carry. When `pids` is given only those are read (the unit's MainPID
+    during a status poll); otherwise the whole process table is swept."""
+    found = []
+    try:
+        entries = [str(int(pid)) for pid in pids] if pids is not None \
+            else [name for name in os.listdir(PROC_DIR) if name.isdigit()]
+    except (OSError, TypeError, ValueError):
+        return found
+    for name in entries:
+        try:
+            with open(os.path.join(PROC_DIR, name, "cmdline"), "rb") as fh:
+                raw = fh.read(CMDLINE_MAX_BYTES)
+        except OSError:
+            continue
+        argv = [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
+        if argv and os.path.basename(argv[0]) == "soloist":
+            found.append((int(name), argv))
+    return found
+
+
+def soloist_key_exposed(props):
+    """The cheap form of the audit, run on every status poll: does the unit
+    systemd would start, or the Soloist process it is running right now, carry
+    the API key on its command line? Only the unit's own properties and its
+    main process are read here — the full sweep belongs to `soloist audit`.
+
+    Nothing this plugin writes can make this true any more, but a unit from a
+    package or one the user wrote by hand still can, and the panel says so
+    rather than staying quiet about it."""
+    if argv_carries_key(unit_exec_argv(props.get("ExecStart"))):
+        return True
+    main_pid = props.get("MainPID") or ""
+    if not main_pid.isdigit() or main_pid == "0":
+        return False
+    return any(argv_carries_key(argv) for _, argv in live_soloist_argv([main_pid]))
+
+
+def soloist_argv_audit():
+    """The full check the marketplace review asks for: read the live unit and
+    process metadata and report whether a Soloist API key is reachable from a
+    command line. Values are never returned — only where a key argument was
+    found, with the argument vectors redacted."""
+    findings = []
+    props = unit_properties("FragmentPath", "ExecStart")
+    unit_argv = unit_exec_argv(props["ExecStart"])
+    if argv_carries_key(unit_argv):
+        findings.append({
+            "source": "unit",
+            "where": props["FragmentPath"] or SOLOIST_SERVICE,
+            "argv": redact_argv(unit_argv),
+        })
+    live = live_soloist_argv()
+    for pid, argv in live:
+        if argv_carries_key(argv):
+            findings.append({
+                "source": "process",
+                "where": "/proc/%d/cmdline" % pid,
+                "argv": redact_argv(argv),
+            })
+    return {
+        # Nothing in this plugin writes a unit or stores a key, so a finding
+        # here is always something outside the reviewed snapshot.
+        "pluginWritesUnit": False,
+        "pluginStoresKey": False,
+        "unitChecked": bool(unit_argv),
+        "processesChecked": len(live),
+        "legacyPluginUnit": unit_is_ours(),
+        "keyInCommandLine": bool(findings),
+        "findings": findings,
+    }
+
+
 def soloist_state():
     """Spotify Soloist — Spotify's own headless Connect client. librespot-based
     daemons (spotifyd, spotify-player) no longer get audio keys for newer
     accounts, so Soloist is what the panel drives. The user installs the
-    binary; this plugin only finds it and wires a systemd *user* service
-    around it."""
+    binary. The service that runs it is the user's too — see the note above
+    KEY_ARGV_FLAGS — so this plugin only finds both and reports on them."""
     binary = find_soloist()
-    env_problem = ""
-    try:
-        lines = read_soloist_env() or []
-    except (OSError, ApiError) as err:
-        lines = []
-        env_problem = getattr(err, "message", "") or str(err)
-    configured = any(line.strip().startswith("SOLOIST_API_KEY=")
-                     and line.strip().split("=", 1)[1].strip().strip('"\'') != "" for line in lines)
-    # A unit may come from this plugin (~/.config/systemd/user) or from a
-    # package the user installed. Only the first kind is ours to delete.
-    unit_path = systemctl_user("show", "-p", "FragmentPath", "--value", SOLOIST_SERVICE)[1]
-    unit_exists = bool(unit_path) or our_unit_exists()
-    managed = unit_is_ours()
-    running = bool(binary) and systemctl_user("is-active", "--quiet", SOLOIST_UNIT)[0] == 0
-    _, exit_status = systemctl_user("show", "-p", "ExecMainStatus", "--value", SOLOIST_UNIT)
-    expired = bool(binary) and not running and exit_status == "10"
+    # A unit may have come from an older version of this plugin
+    # (~/.config/systemd/user) or from a package the user installed. Only the
+    # first kind is ours to delete — and it is now only ever deleted, never
+    # written, because it carries the API key in ExecStart.
+    props = unit_properties("FragmentPath", "ExecStart", "ExecMainStatus", "MainPID", "ActiveState")
+    unit_exists = bool(props["FragmentPath"]) or our_unit_exists()
+    legacy_unit = unit_is_ours()
+    running = bool(binary) and props["ActiveState"] == "active"
+    expired = bool(binary) and not running and props["ExecMainStatus"] == "10"
     paired = False
     try:
         with open_dir(os.path.join(xdg_home("XDG_DATA_HOME", ".local", "share"), "soloist")) as held:
@@ -1299,10 +1438,13 @@ def soloist_state():
         "daemonInstalled": bool(binary),
         "daemonPath": binary,
         "daemonUnit": unit_exists,
-        "daemonManaged": managed,
-        "daemonForeignUnit": unit_exists and not managed,
-        "daemonConfigured": configured,
-        "daemonEnvProblem": env_problem,
+        # A key-bearing unit left behind by an older version of this plugin.
+        # The panel offers to remove it; nothing re-creates it.
+        "daemonLegacyUnit": legacy_unit,
+        # True when the unit systemd would start, or the Soloist process it is
+        # running, passes the API key as a command-line argument. Never true
+        # for anything this plugin wrote, since it writes no unit at all.
+        "daemonKeyInCommandLine": soloist_key_exposed(props),
         "daemonRunning": running,
         "daemonExpired": expired,
         "daemonPaired": paired,
@@ -1358,77 +1500,6 @@ def cmd_status(args):
     out(data)
 
 
-PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-SOLOIST_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]{8,512}$")
-# An absolute path with nothing in it that could break out of the unit file's
-# ExecStart line (no whitespace, quotes, backslashes, newlines or %-specifiers).
-SOLOIST_BIN_RE = re.compile(r"^/[A-Za-z0-9._+@/-]+$")
-
-
-def clean_device_name(name):
-    """Printable, no quotes/backslashes/newlines, so it can't break out of the
-    env file or the unit's quoted argument."""
-    s = re.sub(r"[^\w .()\-]", "", str(name or ""), flags=re.UNICODE).strip()[:40]
-    return s or "Omarchy"
-
-
-def write_soloist_env(key=None, device_name=None):
-    """Create or update ~/.config/soloist/soloist.env, keeping other lines."""
-    if key is not None and not SOLOIST_KEY_RE.match(key):
-        raise ApiError("bad_args", "That doesn't look like a Soloist API key")
-    if device_name is not None:
-        device_name = '"%s"' % clean_device_name(device_name)
-    with soloist_config_dir(create=True) as held:
-        blob = read_file_at(held, SOLOIST_ENV_NAME, SOLOIST_ENV_MAX_BYTES, private=True)
-        if blob is not None:
-            lines = blob.decode("utf-8", "replace").splitlines()
-        else:
-            lines = [
-                "# Spotify Soloist — read by ~/.config/systemd/user/soloist.service",
-                "# SOLOIST_API_KEY comes from https://developer.spotify.com/dashboard →",
-                "# \"Spotify Soloist API Key\". It is tied to your account; keep this file private.",
-                "SOLOIST_API_KEY=",
-                "SOLOIST_DEVICE_NAME=Omarchy",
-            ]
-
-        def put(name, value):
-            for i, line in enumerate(lines):
-                if line.startswith(name + "="):
-                    lines[i] = "%s=%s" % (name, value)
-                    return
-            lines.append("%s=%s" % (name, value))
-        if key is not None:
-            put("SOLOIST_API_KEY", key)
-        if device_name is not None:
-            put("SOLOIST_DEVICE_NAME", device_name)
-        write_file_at(held, SOLOIST_ENV_NAME, ("\n".join(lines) + "\n").encode("utf-8"), 0o600)
-        unlink_at(held, SOLOIST_ENV_NAME + ".tmp")
-
-
-def write_soloist_unit(binary):
-    """Render contrib/systemd/soloist.service for the binary the user already
-    has, into ~/.config/systemd/user. The path is matched against a strict
-    pattern first so nothing can be smuggled into the unit file."""
-    if not SOLOIST_BIN_RE.match(binary):
-        raise ApiError("bad_binary", "Refusing to write a unit for this soloist path")
-    template = os.path.join(PLUGIN_DIR, "contrib", "systemd", SOLOIST_SERVICE)
-    try:
-        with open(template, "rb") as fh:
-            raw = fh.read(UNIT_MAX_BYTES + 1)
-    except OSError as err:
-        raise ApiError("no_template", "Could not read contrib/systemd/%s: %s" % (SOLOIST_SERVICE, err))
-    if len(raw) > UNIT_MAX_BYTES:
-        raise ApiError("no_template", "contrib/systemd/%s is unexpectedly large" % SOLOIST_SERVICE)
-    body = raw.decode("utf-8", "replace")
-    if "@SOLOIST_BIN@" not in body:
-        raise ApiError("no_template", "contrib/systemd/%s has no @SOLOIST_BIN@ placeholder" % SOLOIST_SERVICE)
-    rendered = UNIT_MARKER + "\n" + body.replace("@SOLOIST_BIN@", binary)
-    with systemd_user_dir(create=True) as held:
-        write_file_at(held, SOLOIST_SERVICE, rendered.encode("utf-8"), 0o644)
-        unlink_at(held, SOLOIST_SERVICE + ".tmp")
-
-
 def remove_our_unit():
     try:
         with systemd_user_dir() as held:
@@ -1459,60 +1530,34 @@ def drop_legacy_updater():
 
 
 def cmd_soloist(args):
-    """Wire a systemd user service around a Soloist binary the user installed
-    themselves, store the API key, and take the plugin's own files back off.
+    """Inspect what is already installed around Soloist, take this plugin's own
+    leftovers back off, and audit the live command line for the API key.
 
-    There is deliberately no install or update action. Spotify serves its
-    Soloist builds from one mutable URL with no checksum, no signature and no
-    release manifest, so a download could not be bound to any reviewed
-    artifact — the plugin leaves getting the binary to a package manager or to
-    the user."""
+    There is deliberately no install, no setup and no key action. Soloist reads
+    its API key only from `-k/--api-key` on the command line — no environment
+    variable, no key file, no file descriptor, no config file — and it does not
+    scrub its argv afterwards, so anything that starts Soloist with a key puts
+    that key where `ps`, `systemctl status`, a crash report or a pasted log can
+    pick it up. A unit generated here could not avoid that, so the plugin does
+    not generate one and never stores the key. Writing the service, like
+    installing the binary, is left to a package or to the user."""
     verb = args.action
-    if verb == "setup":
-        binary = find_soloist()
-        if not binary:
-            return fail("no_daemon", SOLOIST_MISSING_HINT, soloist_state())
-        # Any machine reaching setup should not keep the old updater around.
-        drop_legacy_updater()
-        state = soloist_state()
-        # A unit from a package (soloistd and friends) stays the user's to
-        # manage; shadowing it from ~/.config would be a surprise.
-        if not state["daemonForeignUnit"]:
-            write_soloist_unit(binary)
-        if read_soloist_env() is None:
-            write_soloist_env(device_name=args.device_name or "Omarchy")
-        elif args.device_name:
-            write_soloist_env(device_name=args.device_name)
-        systemctl_user("daemon-reload")
-        out(app_state())
-    elif verb == "key":
-        key = (args.value or "").strip()
-        if key == "-":
-            # Read from stdin so the key never appears in a process list.
-            key = sys.stdin.readline(1024).strip()
-        if not key:
-            return fail("bad_args", "Paste the Soloist API key first")
-        binary = find_soloist()
-        if not binary:
-            return fail("no_daemon", SOLOIST_MISSING_HINT, soloist_state())
-        write_soloist_env(key=key)
-        state = soloist_state()
-        if not state["daemonUnit"]:
-            write_soloist_unit(binary)
-        systemctl_user("daemon-reload")
-        code, _ = systemctl_user("enable", "--now", SOLOIST_UNIT)
-        time.sleep(1.5)
+    if verb == "audit":
+        # The check the marketplace review asks for: live unit and process
+        # metadata, reported without the secret it is looking for.
         state = app_state()
-        if code != 0 or not state["daemonRunning"]:
-            return fail("daemon_failed", "Soloist did not start — check `journalctl --user -u soloist`", state)
+        state["audit"] = soloist_argv_audit()
         out(state)
     elif verb == "remove":
-        # Only what this plugin created: the user unit it wrote, plus any
-        # leftovers of the old updater. The binary belongs to the user (or to
-        # their package manager) and is never touched.
+        # Only what this plugin created: a unit an older version of it wrote
+        # (which carries the key in ExecStart), plus any leftovers of the old
+        # updater. The binary and any unit from a package belong to the user
+        # and are never touched.
+        if not unit_is_ours():
+            return fail("not_ours", "This soloist.service did not come from the plugin, so it is "
+                                    "left alone. Remove it the way you installed it.", app_state())
         systemctl_user("disable", "--now", "--quiet", SOLOIST_UNIT)
-        if unit_is_ours():
-            remove_our_unit()
+        remove_our_unit()
         drop_legacy_updater()
         systemctl_user("daemon-reload")
         out(app_state())
@@ -1522,7 +1567,7 @@ def cmd_soloist(args):
         state["updaterRemoved"] = dropped
         out(state)
     else:
-        return fail("bad_args", "soloist action must be setup, key, remove, or drop-updater")
+        return fail("bad_args", "soloist action must be audit, remove, or drop-updater")
 
 
 def cmd_daemon(args):
@@ -1531,10 +1576,7 @@ def cmd_daemon(args):
     if not state["daemonInstalled"]:
         return fail("no_daemon", SOLOIST_MISSING_HINT, state)
     if not state["daemonUnit"]:
-        return fail("no_unit", "No soloist.service yet — use Set up Soloist in the panel first", state)
-    if not state["daemonConfigured"]:
-        return fail("daemon_unconfigured", state["daemonEnvProblem"]
-                    or "Add your Soloist API key to ~/.config/soloist/soloist.env first", state)
+        return fail("no_unit", SOLOIST_UNIT_HINT, state)
     verb = args.action
     if verb not in ("start", "stop", "restart"):
         return fail("bad_args", "daemon action must be start, stop, or restart")
@@ -2034,8 +2076,7 @@ def build_parser():
     sub.add_parser("logout").set_defaults(fn=cmd_logout)
     sub.add_parser("me").set_defaults(fn=cmd_me)
     p = sub.add_parser("daemon"); p.add_argument("action"); p.set_defaults(fn=cmd_daemon)
-    p = sub.add_parser("soloist"); p.add_argument("action"); p.add_argument("value", nargs="?", default="")
-    p.add_argument("--device-name", default=""); p.set_defaults(fn=cmd_soloist)
+    p = sub.add_parser("soloist"); p.add_argument("action"); p.set_defaults(fn=cmd_soloist)
 
     sub.add_parser("player").set_defaults(fn=cmd_player)
     sub.add_parser("devices").set_defaults(fn=cmd_devices)

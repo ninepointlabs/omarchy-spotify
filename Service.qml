@@ -65,15 +65,19 @@ Item {
   property bool appInstalled: false
   property bool appRunning: false
   // Spotify Soloist: the headless Spotify Connect device, run as a systemd
-  // user service. The user installs the binary themselves; the bridge reports
-  // whether it found one, whether a soloist.service exists (and whether this
-  // plugin wrote it), and how the service is doing.
+  // user service. Both the binary and the service are the user's to install —
+  // Soloist takes its API key only as a command-line argument, so a unit
+  // generated here would have to put that secret into the process command
+  // line. The plugin only reports what it finds and drives start/stop.
   property bool daemonInstalled: false
   property string daemonPath: ""
   property bool daemonUnit: false
-  property bool daemonManaged: false
-  property bool daemonForeignUnit: false
-  property bool daemonConfigured: false
+  // A key-bearing unit an older version of this plugin wrote, still installed.
+  property bool daemonLegacyUnit: false
+  // The unit (or the running process) passes the API key on the command line,
+  // where ps, systemctl status and crash reports can read it. Nothing this
+  // plugin writes can cause this; a unit from elsewhere still can.
+  property bool daemonKeyInCommandLine: false
   property bool daemonRunning: false
   property bool daemonExpired: false
   property bool daemonPaired: false
@@ -81,9 +85,8 @@ Item {
   // the Soloist binary. It is gone; this flags machines that still carry it so
   // the panel can offer to take it off.
   property bool legacyUpdater: false
-  // Ready to start: a binary was found, a soloist.service exists, and the key
-  // is in place.
-  readonly property bool daemonReady: daemonInstalled && daemonUnit && daemonConfigured
+  // Ready to start: a binary was found and a soloist.service exists.
+  readonly property bool daemonReady: daemonInstalled && daemonUnit
   readonly property bool hasLocalDevice: appInstalled || daemonInstalled
   property string storedClientId: ""
   property var user: ({})
@@ -177,19 +180,12 @@ Item {
     Process {
       id: proc
       property var callback: null
-      // Secrets go in through stdin, never argv, so they don't show up in
-      // the process list. Consumed on start and cleared.
-      property string stdinText: ""
       running: false
       clearEnvironment: true
       environment: root.bridgeEnvironment
-      stdinEnabled: stdinText !== ""
-      onStarted: {
-        if (stdinText !== "") {
-          write(stdinText)
-          stdinText = ""
-        }
-      }
+      // The bridge is never handed a secret to read: no call passes anything
+      // on stdin, and no argument it is given is one.
+      stdinEnabled: false
       stdout: StdioCollector { id: outCollector; waitForEnd: true }
       stderr: StdioCollector { id: errCollector; waitForEnd: true }
       onExited: function(exitCode, exitStatus) {
@@ -211,12 +207,12 @@ Item {
     }
   }
 
-  function call(args, callback, stdinText) {
+  function call(args, callback) {
     if (!active) return null
     if (python === "" && pythonError === "") {
       // Calls made before the interpreter is known wait for the probe.
       var queued = _queuedCalls
-      queued.push({ args: args, callback: callback, stdinText: stdinText || "" })
+      queued.push({ args: args, callback: callback })
       _queuedCalls = queued
       resolvePython()
       return null
@@ -228,7 +224,7 @@ Item {
       if (callback) Qt.callLater(function() { callback(failure) })
       return null
     }
-    var proc = bridgeProcess.createObject(root, { command: command, callback: callback, stdinText: stdinText || "" })
+    var proc = bridgeProcess.createObject(root, { command: command, callback: callback })
     if (!proc) return null
     proc.running = true
     return proc
@@ -284,7 +280,7 @@ Item {
   function flushQueuedCalls() {
     var queued = _queuedCalls
     _queuedCalls = []
-    for (var i = 0; i < queued.length; i++) call(queued[i].args, queued[i].callback, queued[i].stdinText)
+    for (var i = 0; i < queued.length; i++) call(queued[i].args, queued[i].callback)
   }
 
   Component {
@@ -399,9 +395,8 @@ Item {
       root.daemonInstalled = d.daemonInstalled === true
       root.daemonPath = d.daemonPath || ""
       root.daemonUnit = d.daemonUnit === true
-      root.daemonManaged = d.daemonManaged === true
-      root.daemonForeignUnit = d.daemonForeignUnit === true
-      root.daemonConfigured = d.daemonConfigured === true
+      root.daemonLegacyUnit = d.daemonLegacyUnit === true
+      root.daemonKeyInCommandLine = d.daemonKeyInCommandLine === true
       root.daemonRunning = d.daemonRunning === true
       root.daemonExpired = d.daemonExpired === true
       root.daemonPaired = d.daemonPaired === true
@@ -723,10 +718,12 @@ Item {
     appLaunchTimer.restart()
   }
 
-  // ---- Soloist setup, driven from the panel. This only ever writes local
-  //      config: the systemd *user* unit and the env file. Getting the binary
-  //      is the user's job (package manager or Spotify's own download), because
-  //      Spotify ships no checksum or signature to verify a download against.
+  // ---- Soloist housekeeping, driven from the panel. Nothing here creates a
+  //      service or stores a credential: the only writes left are deletions of
+  //      files older versions of this plugin installed. Getting the binary is
+  //      the user's job (Spotify ships no checksum or signature to verify a
+  //      download against), and so is the unit that runs it, because Soloist
+  //      accepts its API key only as a command-line argument.
   property bool soloistBusy: false
   property string soloistError: ""
 
@@ -734,9 +731,8 @@ Item {
     daemonInstalled = d.daemonInstalled === true
     daemonPath = d.daemonPath || ""
     daemonUnit = d.daemonUnit === true
-    daemonManaged = d.daemonManaged === true
-    daemonForeignUnit = d.daemonForeignUnit === true
-    daemonConfigured = d.daemonConfigured === true
+    daemonLegacyUnit = d.daemonLegacyUnit === true
+    daemonKeyInCommandLine = d.daemonKeyInCommandLine === true
     daemonRunning = d.daemonRunning === true
     daemonExpired = d.daemonExpired === true
     daemonPaired = d.daemonPaired === true
@@ -745,18 +741,6 @@ Item {
     appRunning = d.appRunning === true
     if (d.appBinary !== undefined) appBinary = d.appBinary || ""
     if (d.tools !== undefined) tools = d.tools || {}
-  }
-
-  function setUpSoloist() {
-    if (soloistBusy) return
-    soloistBusy = true
-    soloistError = ""
-    call(["soloist", "setup"], function(result) {
-      root.soloistBusy = false
-      if (!result.ok) { root.soloistError = result.error; if (result.daemonInstalled !== undefined) root.applyDaemonState(result); return }
-      root.applyDaemonState(result.data)
-      root.flash("Soloist service ready — paste your API key", false)
-    })
   }
 
   // Removes the weekly re-download timer an old version of this plugin left
@@ -773,29 +757,18 @@ Item {
     })
   }
 
-  function setSoloistKey(key) {
-    var k = String(key || "").trim()
-    if (k === "") { soloistError = "Paste the Soloist API key first."; return }
-    if (soloistBusy) return
-    soloistBusy = true
-    soloistError = ""
-    call(["soloist", "key", "-"], function(result) {
-      root.soloistBusy = false
-      if (!result.ok) { root.soloistError = result.error; if (result.daemonInstalled !== undefined) root.applyDaemonState(result); return }
-      root.applyDaemonState(result.data)
-      root.flash(root.daemonPaired ? "Soloist is running" : "Soloist is running — pick “Omarchy” once in the Spotify app", false)
-      appLaunchTimer.restart()
-    }, k + "\n")
-  }
-
+  // Deletes a key-bearing soloist.service an older version of this plugin
+  // wrote. A unit from a package, or one the user wrote, is refused by the
+  // bridge and left alone.
   function removeSoloist() {
     if (soloistBusy) return
     soloistBusy = true
+    soloistError = ""
     call(["soloist", "remove"], function(result) {
       root.soloistBusy = false
       if (!result.ok) { root.soloistError = result.error; return }
       root.applyDaemonState(result.data)
-      root.flash("Soloist service removed — the binary itself was left alone", false)
+      root.flash("Removed the old plugin-written service — the binary itself was left alone", false)
     })
   }
 

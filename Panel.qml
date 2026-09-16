@@ -92,8 +92,7 @@ Panel {
     if (service.premiumRequired) return "Spotify Premium is required for playback control"
     if (playerActive && service.deviceName !== "") return (isPlaying ? "Playing on " : "Paused on ") + service.deviceName
     if (service.daemonExpired) return "Soloist build expired — update it with your package manager"
-    if (service.daemonInstalled && !service.daemonUnit) return "Soloist is installed — set up its service to play here"
-    if (service.daemonInstalled && !service.daemonConfigured) return "Soloist needs its API key in ~/.config/soloist/soloist.env"
+    if (service.daemonInstalled && !service.daemonUnit) return "Soloist is installed — it needs a soloist.service to run under"
     if (service.daemonReady && !service.daemonRunning) return "Soloist isn't running — start it to play here"
     if (service.daemonRunning && !service.daemonPaired) return "Pick “Omarchy” once in the Spotify app to pair Soloist"
     if (service.noDevice) return "No active device — pick one or start a player"
@@ -382,7 +381,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: searchField.activeFocus || clientIdField.activeFocus || soloistKeyField.activeFocus
+      blocked: searchField.activeFocus || clientIdField.activeFocus
       onMoveRequested: function(dx, dy) {
         if (dy !== 0) root.moveCursor(dy)
         else if (dx < 0 && root.detailOpen) root.goBack()
@@ -1108,12 +1107,17 @@ Panel {
               }
             }
 
-            // ---- Headless player: Spotify Soloist. The binary is the user's
-            //      to install (package manager or Spotify's own download); the
-            //      panel only finds it and wires up a systemd user service and
-            //      the API key around it. It never fetches an executable —
-            //      Spotify publishes no checksum or signature for its Soloist
-            //      builds, so a download could not be verified.
+            // ---- Headless player: Spotify Soloist. Both the binary and the
+            //      service around it are the user's to install. The panel
+            //      never fetches an executable (Spotify publishes no checksum
+            //      or signature for its Soloist builds) and never writes a
+            //      unit or stores the API key: Soloist reads that key only
+            //      from --api-key on the command line, so any unit generated
+            //      here would have to expand the secret into a command line
+            //      that ps, systemctl status and crash reports can read. The
+            //      panel finds Soloist, starts and stops it, warns when the
+            //      running command line carries the key, and removes the
+            //      key-bearing unit older versions of this plugin wrote.
             PanelSectionHeader {
               topPadding: Style.space(8)
               text: "HEADLESS PLAYER"
@@ -1131,9 +1135,7 @@ Panel {
               text: {
                 if (!root.service) return ""
                 if (!root.service.daemonInstalled) return "Spotify Soloist plays with no window: Spotify's own headless Connect device, run as a background service. Premium required. Install it yourself first — this panel does not download it."
-                if (!root.service.daemonUnit) return "Found soloist at " + root.service.daemonPath + ". Click Set up Soloist to add the background service for it."
-                if (!root.service.daemonConfigured && root.service.daemonForeignUnit) return "A soloist.service from your system is in charge here, so the plugin left it alone. Generate a key at developer.spotify.com/dashboard → “Spotify Soloist API Key”; paste it below if that unit reads ~/.config/soloist/soloist.env, otherwise configure it however that package documents."
-                if (!root.service.daemonConfigured) return "Service ready. Now generate a key at developer.spotify.com/dashboard → “Spotify Soloist API Key”, and paste it here."
+                if (!root.service.daemonUnit) return "Found soloist at " + root.service.daemonPath + ", but no soloist.service to run it. Install the service from your package, or write your own unit — this plugin no longer generates one. See “Running Soloist yourself” in the README."
                 if (root.service.daemonExpired) return "The Soloist build expired after 90 days. Update it the way you installed it, then start it again."
                 if (!root.service.daemonRunning) return "Soloist is installed but stopped."
                 if (!root.service.daemonPaired) return "Soloist is running as “Omarchy”. Pick it once in the Spotify app's device picker to pair; after that it appears above."
@@ -1152,6 +1154,23 @@ Panel {
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               text: "Get the binary from a source you trust, not from this panel:\n  ·  your package manager — on Arch/Omarchy the AUR package spotify-soloist-bin\n  ·  or Spotify's own instructions at developer.spotify.com/documentation/soloist\nOnce a package has put soloist in /usr/bin, or you have unpacked it into ~/.local/bin, come back here. Your PATH is not searched."
+            }
+
+            // The API key on the running command line. Nothing this plugin
+            // writes can cause this, but a unit from a package — or one an
+            // older version of this plugin wrote — still can, and the user is
+            // the only one who can fix it, so say so plainly.
+            Text {
+              visible: root.service && root.service.daemonKeyInCommandLine
+              width: parent.width
+              wrapMode: Text.Wrap
+              textFormat: Text.PlainText
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              text: (root.service && root.service.daemonLegacyUnit
+                     ? "The soloist.service an older version of this plugin wrote passes your API key as --api-key on the command line, where ps, systemctl status and crash reports can read it. This version writes no unit at all. Remove the old one below, then install Soloist's service from your package or write your own."
+                     : "The soloist.service running here passes your API key as --api-key on the command line, where ps, systemctl status and crash reports can read it. It did not come from this plugin, so the plugin leaves it alone — Soloist accepts no other way of taking the key, so treat that key as exposed to anything that can read /proc.")
             }
 
             // A weekly auto-updater that an older version of this plugin
@@ -1194,61 +1213,11 @@ Panel {
             }
 
             Row {
-              visible: root.service && root.service.daemonInstalled && root.service.daemonUnit && !root.service.daemonConfigured
-              width: parent.width
-              spacing: Style.space(8)
-
-              TextField {
-                id: soloistKeyField
-                width: parent.width - soloistKeyButton.width - parent.spacing
-                placeholderText: "Soloist API key"
-                password: true
-                foreground: root.foreground
-                accent: root.accent
-                font.family: root.fontFamily
-                verticalPadding: Style.space(5)
-                enabled: !(root.service && root.service.soloistBusy)
-                Keys.onReturnPressed: if (root.service) root.service.setSoloistKey(text)
-                Keys.onEscapePressed: keyCatcher.forceActiveFocus()
-              }
-
-              Button {
-                id: soloistKeyButton
-                text: root.service && root.service.soloistBusy ? "Starting…" : "Start"
-                bordered: true
-                foreground: root.foreground
-                background: Color.popups.background
-                accent: root.accent
-                fontFamily: root.fontFamily
-                fontSize: Style.font.bodySmall
-                horizontalPadding: Style.spacing.controlPaddingX
-                verticalPadding: Style.space(4)
-                anchors.verticalCenter: parent.verticalCenter
-                onClicked: if (root.service) root.service.setSoloistKey(soloistKeyField.text)
-              }
-            }
-
-            Row {
               spacing: Style.space(6)
 
               Button {
-                visible: root.service && root.service.daemonInstalled && !root.service.daemonUnit
-                text: root.service && root.service.soloistBusy ? "Setting up…" : "Set up Soloist"
-                bordered: true
-                foreground: root.foreground
-                background: Color.popups.background
-                accent: root.accent
-                fontFamily: root.fontFamily
-                fontSize: Style.font.bodySmall
-                horizontalPadding: Style.space(10)
-                verticalPadding: Style.space(4)
-                enabled: !(root.service && root.service.soloistBusy)
-                onClicked: if (root.service) root.service.setUpSoloist()
-              }
-
-              Button {
-                visible: root.service && (root.service.daemonManaged || root.service.legacyUpdater)
-                text: "Remove Soloist service"
+                visible: root.service && root.service.daemonLegacyUnit
+                text: root.service && root.service.soloistBusy ? "Removing…" : "Remove the old plugin service"
                 foreground: root.foreground
                 accent: root.accent
                 fontFamily: root.fontFamily
