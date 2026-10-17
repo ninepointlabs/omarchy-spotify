@@ -1495,6 +1495,7 @@ def cmd_status(args):
         "user": auth.get("user") or {},
         "authorizedAt": auth.get("authorized_at", 0),
         "lastPlayed": load_last(),
+        "python": "%d.%d.%d" % sys.version_info[:3],  # for the About page
     }
     data.update(app_state())
     out(data)

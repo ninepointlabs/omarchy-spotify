@@ -15,6 +15,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import shutil
 import signal
 import socket
@@ -24,6 +25,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -699,6 +701,62 @@ class ExecutableTests(TempHome):
         self.assertNotIn("BASH_ENV", text)
         self.assertNotIn("LEAK_CHECK", text)
         self.assertIn("PATH=" + bridge.TRUSTED_PATH, text.splitlines())
+
+
+class AboutTests(TempHome):
+    """The About page's privacy statement (About.js) has to name every host the
+    plugin can reach, so adding one without saying so fails here."""
+
+    # URLs that appear in shipped code but are never requested by the plugin.
+    NOT_CONTACTED = {
+        "github.com": "only part of the User-Agent string",
+        "developer.spotify.com": "documentation link in an error message for the user",
+    }
+
+    def privacy(self):
+        about = (ROOT / "About.js").read_text(encoding="utf-8")
+        return about[about.index("var PRIVACY"):about.index("function manifestVersion")]
+
+    def test_privacy_names_the_bridge_hosts(self):
+        privacy = self.privacy()
+        for url in (bridge.API, bridge.ACCOUNTS):
+            self.assertIn(urllib.parse.urlsplit(url).hostname, privacy)
+        # ART_HOST_RE is "(any subdomain of) one of these": each one by name.
+        domains = re.search(r"\(\?:([^()]*)\)\$$", bridge.ART_HOST_RE.pattern).group(1).split("|")
+        self.assertGreaterEqual(len(domains), 2)
+        for domain in domains:
+            self.assertIn("*." + domain.replace("\\.", "."), privacy)
+        self.assertIn("127.0.0.1", privacy)
+        self.assertIn("No telemetry", privacy)
+
+    def test_privacy_names_every_url_in_shipped_code(self):
+        privacy = self.privacy()
+        hosts = set()
+        for path in sorted(ROOT.rglob("*")):
+            rel = str(path.relative_to(ROOT))
+            if not path.is_file() or rel.startswith((".git/", "tests/")) or path.suffix in (".png", ".md"):
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            hosts.update(re.findall(r"https?://([A-Za-z0-9.-]+)", text))
+        self.assertIn("api.spotify.com", hosts)
+        for host in sorted(hosts):
+            if host in self.NOT_CONTACTED:
+                continue
+            self.assertIn(host, privacy, "%s is reachable but not named in About.js PRIVACY" % host)
+
+    def test_privacy_names_the_files_it_keeps(self):
+        privacy = self.privacy()
+        self.assertIn("~/.local/state/omarchy-spotify/auth.json", privacy)
+        self.assertIn("0600", privacy)
+        self.assertIn("~/.cache/omarchy-spotify/art", privacy)
+        self.assertIn("~/.config/omarchy/shell.json", privacy)
+
+    def test_status_reports_the_python_version(self):
+        buf = io.StringIO()
+        with mock.patch.object(bridge, "app_state", return_value={}), mock.patch.object(sys, "stdout", buf):
+            bridge.cmd_status(None)
+        data = json.loads(buf.getvalue())["data"]
+        self.assertEqual(data["python"], "%d.%d.%d" % sys.version_info[:3])
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
   "id": "ninepointlabs.spotify",
   "name": "Spotify",
   "version": "0.1.0",
-  "author": "Ninepoint Labs",
+  "author": "Nine Point Labs",
   "license": "MIT",
   "description": "Spotify in the Omarchy bar — now-playing chip with album art, transport, volume and device controls, plus Search, Playlists, Audiobooks and Podcasts tabs backed by the Spotify Web API.",
   "kinds": [

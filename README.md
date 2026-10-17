@@ -31,6 +31,12 @@ even play music with no Spotify window open at all.
 - **Devices:** switch between your computer, phone, speakers and so on, or
   set up a headless player that needs no window (more below).
 - **Keyboard:** everything works without a mouse. See the cheat sheet.
+- **About:** the 󰋽 button at the top of the panel (or `i`, or
+  `omarchy-shell ninepointlabs.spotify about`) shows the version, the license
+  (readable in place), Nine Point Labs, what the plugin does with your data,
+  and the support address, [help@ninepointlabs.com](mailto:help@ninepointlabs.com),
+  with *Email*, *Copy* and *Copy version details* buttons. Back or `Esc`
+  returns to the player.
 
 ## Before you start
 
@@ -242,6 +248,7 @@ is on a command line, without printing the key itself.
 | `h` or `Esc` | go back out of a playlist, book or podcast |
 | `d` | devices |
 | `r` | refresh |
+| `i` | About (version, license, privacy, support); `Esc` goes back |
 | `Tab` / `Shift+Tab` | switch to the next / previous bar panel |
 | `Esc` | close |
 
@@ -307,6 +314,7 @@ Two IPC targets are available while the shell runs:
 
 ```sh
 omarchy-shell ninepointlabs.spotify toggle   # open/close the panel
+omarchy-shell ninepointlabs.spotify about    # open the panel on its About page
 omarchy-shell spotify playPause              # also next, previous, volumeUp, volumeDown
 omarchy-shell spotify status                 # JSON: playing, title, artist, device, progress
 ```
