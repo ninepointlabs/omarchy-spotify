@@ -94,6 +94,7 @@ Item {
   // The most recent item that had cover art, remembered by the bridge across
   // shell restarts so the bar chip has a picture before the first poll.
   property var lastPlayed: ({})
+  property string pythonVersion: ""  // the bridge's interpreter, for the About page
 
   // ---- Login flow
   property bool authRunning: false
@@ -403,6 +404,7 @@ Item {
       root.legacyUpdater = d.legacyUpdater === true
       root.user = d.user || {}
       root.lastPlayed = d.lastPlayed || {}
+      root.pythonVersion = /^[0-9]{1,3}(\.[0-9]{1,3}){1,2}$/.test(String(d.python || "")) ? d.python : ""
       if (root.authenticated) {
         root.refreshPlayer()
         root.refreshRecentIfStale()
